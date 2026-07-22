@@ -1,8 +1,10 @@
 import os
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+
+from tools import read_note
 
 
 load_dotenv()
@@ -13,6 +15,10 @@ model = ChatOpenAI(
     base_url=os.getenv("ZHIPU_BASE_URL"),
     temperature=0.7,
 )
+model_with_tools = model.bind_tools([read_note])
+tools_by_name = {read_note.name: read_note}
+
+MAX_AGENT_LOOPS = 5
 
 messages = [
     SystemMessage(
@@ -31,12 +37,30 @@ while True:
 
     messages.append(HumanMessage(content=question))
 
-    print("\nAI：", end="", flush=True)
-    response_parts = []
-    for chunk in model.stream(messages):
-        if chunk.content:
-            print(chunk.content, end="", flush=True)
-            response_parts.append(chunk.content)
-    print()
+    answered = False
+    for _ in range(MAX_AGENT_LOOPS):
+        response = model_with_tools.invoke(messages)
+        messages.append(response)
 
-    messages.append(AIMessage(content="".join(response_parts)))
+        if not response.tool_calls:
+            print(f"\nAI：{response.content}")
+            answered = True
+            break
+
+        for tool_call in response.tool_calls:
+            tool_name = tool_call["name"]
+            selected_tool = tools_by_name[tool_name]
+
+            print(f"[工具调用] {tool_name}")
+            tool_result = selected_tool.invoke(tool_call["args"])
+
+            messages.append(
+                ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=tool_call["id"],
+                )
+            )
+
+    if not answered:
+        print(f"\nAI：Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
+        break
