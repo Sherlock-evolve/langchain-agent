@@ -1,3 +1,4 @@
+import os
 from pathlib import Path, PureWindowsPath
 
 from langchain_core.tools import tool
@@ -15,6 +16,25 @@ IGNORED_DIRECTORIES = {
     "node_modules",
     "venv",
 }
+MAX_SEARCH_RESULTS = 50
+MAX_SEARCH_LINE_LENGTH = 300
+
+
+def _is_sensitive_name(name: str) -> bool:
+    lowercase_name = name.lower()
+    return (
+        lowercase_name == ".env"
+        or lowercase_name.startswith(".env.")
+        or lowercase_name.endswith(".pem")
+        or lowercase_name.endswith(".key")
+    )
+
+
+def _is_hidden_path(path: Path) -> bool:
+    return any(
+        part in IGNORED_DIRECTORIES or _is_sensitive_name(part)
+        for part in path.parts
+    )
 
 
 def _resolve_workspace_path(path: str) -> Path:
@@ -32,8 +52,8 @@ def _resolve_workspace_path(path: str) -> Path:
     if ".." in relative_path.parts or ".." in windows_path.parts:
         raise ValueError("不允许使用 '..' 进行路径穿越")
 
-    if any(part in IGNORED_DIRECTORIES for part in relative_path.parts):
-        raise ValueError("不允许访问被忽略的目录")
+    if _is_hidden_path(relative_path):
+        raise ValueError("不允许访问被忽略或敏感的路径")
 
     resolved_path = (WORKSPACE_ROOT / relative_path).resolve()
     try:
@@ -41,8 +61,8 @@ def _resolve_workspace_path(path: str) -> Path:
     except ValueError as error:
         raise ValueError("路径超出当前项目目录") from error
 
-    if any(part in IGNORED_DIRECTORIES for part in resolved_relative_path.parts):
-        raise ValueError("不允许访问被忽略的目录")
+    if _is_hidden_path(resolved_relative_path):
+        raise ValueError("不允许访问被忽略或敏感的路径")
 
     return resolved_path
 
@@ -58,7 +78,7 @@ def list_files(directory: str = ".") -> str:
 
     entries = []
     for entry in directory_path.iterdir():
-        if entry.name in IGNORED_DIRECTORIES and entry.is_dir():
+        if entry.name in IGNORED_DIRECTORIES or _is_sensitive_name(entry.name):
             continue
 
         resolved_entry = entry.resolve()
@@ -67,7 +87,7 @@ def list_files(directory: str = ".") -> str:
         except ValueError:
             continue
 
-        if any(part in IGNORED_DIRECTORIES for part in relative_entry.parts):
+        if _is_hidden_path(relative_entry):
             continue
 
         display_path = entry.relative_to(WORKSPACE_ROOT).as_posix()
@@ -88,3 +108,99 @@ def read_file(path: str) -> str:
         raise IsADirectoryError(f"不是文件：{path}")
 
     return file_path.read_text(encoding="utf-8")
+
+
+@tool
+def search_text(query: str, directory: str = ".") -> str:
+    """在当前项目的指定目录中递归搜索文本；目录必须是项目内的相对路径。"""
+    if not query.strip():
+        raise ValueError("搜索内容不能为空")
+
+    directory_path = _resolve_workspace_path(directory)
+    if not directory_path.exists():
+        raise FileNotFoundError(f"目录不存在：{directory}")
+    if not directory_path.is_dir():
+        raise NotADirectoryError(f"不是目录：{directory}")
+
+    results = []
+    results_truncated = False
+    result_limit_reached = False
+
+    for current_directory, directory_names, file_names in os.walk(
+        directory_path,
+        topdown=True,
+        followlinks=False,
+    ):
+        current_path = Path(current_directory)
+        allowed_directories = []
+
+        for directory_name in directory_names:
+            child_directory = current_path / directory_name
+            if (
+                directory_name in IGNORED_DIRECTORIES
+                or _is_sensitive_name(directory_name)
+                or child_directory.is_symlink()
+            ):
+                continue
+
+            try:
+                relative_child = child_directory.resolve().relative_to(WORKSPACE_ROOT)
+            except (OSError, ValueError):
+                continue
+
+            if _is_hidden_path(relative_child):
+                continue
+            allowed_directories.append(directory_name)
+
+        directory_names[:] = sorted(allowed_directories)
+
+        for file_name in sorted(file_names):
+            file_path = current_path / file_name
+            if _is_sensitive_name(file_name):
+                continue
+
+            try:
+                resolved_file = file_path.resolve()
+                relative_file = resolved_file.relative_to(WORKSPACE_ROOT)
+            except (OSError, ValueError):
+                continue
+
+            if _is_hidden_path(relative_file):
+                continue
+            if not resolved_file.is_file():
+                continue
+
+            try:
+                content = resolved_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+
+            display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if query not in line:
+                    continue
+
+                if len(results) >= MAX_SEARCH_RESULTS:
+                    results_truncated = True
+                    result_limit_reached = True
+                    break
+
+                result = f"{display_path}:{line_number}:{line}"
+                if len(result) > MAX_SEARCH_LINE_LENGTH:
+                    result = result[:MAX_SEARCH_LINE_LENGTH]
+                    results_truncated = True
+                results.append(result)
+
+            if result_limit_reached:
+                break
+
+        if result_limit_reached:
+            break
+
+    if not results:
+        return "未找到匹配结果"
+
+    if results_truncated:
+        results.append("结果已截断")
+
+    return "\n".join(results)

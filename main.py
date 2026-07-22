@@ -1,3 +1,4 @@
+import json
 import os
 
 from dotenv import load_dotenv
@@ -9,7 +10,7 @@ from langchain_core.messages import (
 )
 from langchain_openai import ChatOpenAI
 
-from tools import list_files, read_file
+from tools import list_files, read_file, search_text
 
 
 load_dotenv()
@@ -18,9 +19,9 @@ model = ChatOpenAI(
     model=os.getenv("ZHIPU_MODEL"),
     api_key=os.getenv("ZHIPU_API_KEY"),
     base_url=os.getenv("ZHIPU_BASE_URL"),
-    temperature=0.7,
+    temperature=0,
 )
-tools = [list_files, read_file]
+tools = [list_files, read_file, search_text]
 tools_by_name = {tool.name: tool for tool in tools}
 model_with_tools = model.bind_tools(tools)
 
@@ -47,15 +48,20 @@ while True:
 
     messages.append(HumanMessage(content=question))
 
-    print("\nAI：", end="", flush=True)
-    cursor_at_line_start = False
+    print()
+    ai_label_printed = False
+    cursor_at_line_start = True
     answered = False
+    task_stopped = False
 
-    for _ in range(MAX_AGENT_LOOPS):
+    for step in range(1, MAX_AGENT_LOOPS + 1):
         response_chunk = None
 
         for chunk in model_with_tools.stream(messages):
             if chunk.content:
+                if not ai_label_printed:
+                    print("AI：", end="", flush=True)
+                    ai_label_printed = True
                 print(chunk.content, end="", flush=True)
                 cursor_at_line_start = chunk.content.endswith("\n")
 
@@ -63,6 +69,14 @@ while True:
                 response_chunk = chunk
             else:
                 response_chunk = response_chunk + chunk
+
+        if response_chunk is None:
+            if not cursor_at_line_start:
+                print()
+                cursor_at_line_start = True
+            print("[系统] 模型未返回任何消息，当前任务已停止。")
+            task_stopped = True
+            break
 
         response = message_chunk_to_message(response_chunk)
         messages.append(response)
@@ -80,23 +94,37 @@ while True:
 
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
-            print(f"[工具调用] {tool_name}")
+            args_text = json.dumps(
+                tool_call["args"],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            print(f"[第 {step} 轮工具调用] {tool_name} {args_text}")
 
             try:
                 selected_tool = tools_by_name[tool_name]
-                tool_result = selected_tool.invoke(tool_call["args"])
+                tool_result_text = str(selected_tool.invoke(tool_call["args"]))
+                tool_succeeded = True
             except Exception as error:
-                tool_result = f"工具执行失败：{error}"
+                tool_result_text = f"工具执行失败：{error}"
+                tool_succeeded = False
+
+            result_status = "成功" if tool_succeeded else "失败"
+            print(
+                f"[工具结果] {result_status}，"
+                f"返回 {len(tool_result_text)} 个字符"
+            )
 
             messages.append(
                 ToolMessage(
-                    content=str(tool_result),
+                    content=tool_result_text,
                     tool_call_id=tool_call["id"],
                 )
             )
 
     if not answered:
-        if not cursor_at_line_start:
-            print()
-        print(f"[系统] Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
+        if not task_stopped:
+            if not cursor_at_line_start:
+                print()
+            print(f"[系统] Agent 循环达到 {MAX_AGENT_LOOPS} 次上限，已停止。")
         continue
