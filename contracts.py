@@ -81,3 +81,11 @@ AgentEvent = (
     | MemoryUpdatedEvent
     | SessionSavedEvent
 )
+
+
+@dataclass(frozen=True)
+class EventEnvelope:
+    session_id: str
+    turn_id: str
+    sequence: int
+    event: AgentEvent

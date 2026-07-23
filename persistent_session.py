@@ -1,14 +1,18 @@
 from collections.abc import Callable, Generator
 from copy import deepcopy
 from threading import Lock
+from uuid import uuid4
 
 import session_store
 from agent import WorkspaceAgent
 from contracts import (
     AgentEvent,
     ApprovalDecision,
+    EventEnvelope,
     SessionSavedEvent,
 )
+
+MAX_TURN_ID_LENGTH = 128
 
 
 class PersistentSessionError(Exception):
@@ -30,9 +34,18 @@ class PersistentSession:
         self,
         session_id: str,
         agent: WorkspaceAgent,
+        turn_id_factory: Callable[[], str] | None = None,
     ):
+        if turn_id_factory is not None and not callable(turn_id_factory):
+            raise TypeError("turn_id_factory 必须可调用")
+
         self.session_id = session_id
         self.agent = agent
+        self.turn_id_factory = (
+            turn_id_factory
+            if turn_id_factory is not None
+            else self._default_turn_id
+        )
         self._dirty = False
         self._pending_snapshot = None
         self._operation_lock = Lock()
@@ -42,6 +55,7 @@ class PersistentSession:
         cls,
         session_id: str,
         agent_factory: Callable[[], WorkspaceAgent],
+        turn_id_factory: Callable[[], str] | None = None,
     ) -> "PersistentSession":
         try:
             snapshot = session_store.load(session_id)
@@ -67,6 +81,7 @@ class PersistentSession:
         return cls(
             session_id=session_id,
             agent=agent,
+            turn_id_factory=turn_id_factory,
         )
 
     @property
@@ -76,7 +91,7 @@ class PersistentSession:
     def stream_turn(
         self,
         question: str,
-    ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
+    ) -> Generator[EventEnvelope, ApprovalDecision | None, None]:
         if not self._operation_lock.acquire(blocking=False):
             raise RuntimeError("持久化会话已有正在进行的操作")
 
@@ -85,9 +100,55 @@ class PersistentSession:
                 raise PersistentSessionSaveError(
                     "会话存在尚未保存的状态，请先调用 flush()"
                 )
-            yield from self._stream_and_persist(question)
+            turn_id = self._create_turn_id()
+            events = self._stream_and_persist(question)
+            yield from self._envelope_events(events, turn_id)
         finally:
             self._operation_lock.release()
+
+    @staticmethod
+    def _default_turn_id() -> str:
+        return str(uuid4())
+
+    def _create_turn_id(self) -> str:
+        turn_id = self.turn_id_factory()
+        if not isinstance(turn_id, str):
+            raise ValueError("turn_id_factory 必须返回字符串")
+        if not turn_id.strip():
+            raise ValueError("turn_id 不能为空")
+        if len(turn_id) > MAX_TURN_ID_LENGTH:
+            raise ValueError(
+                f"turn_id 不能超过 {MAX_TURN_ID_LENGTH} 个字符"
+            )
+        return turn_id
+
+    def _envelope_events(
+        self,
+        events: Generator[AgentEvent, ApprovalDecision | None, None],
+        turn_id: str,
+    ) -> Generator[EventEnvelope, ApprovalDecision | None, None]:
+        sequence = 0
+        decision = None
+        completed = False
+
+        try:
+            while True:
+                try:
+                    event = events.send(decision)
+                except StopIteration:
+                    completed = True
+                    return
+
+                sequence += 1
+                decision = yield EventEnvelope(
+                    session_id=self.session_id,
+                    turn_id=turn_id,
+                    sequence=sequence,
+                    event=event,
+                )
+        finally:
+            if not completed:
+                events.close()
 
     def _stream_and_persist(
         self,

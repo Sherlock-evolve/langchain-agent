@@ -2,6 +2,7 @@ import json
 import stat
 from collections import deque
 from copy import deepcopy
+from uuid import UUID
 
 import pytest
 from langchain_core.messages import (
@@ -26,7 +27,7 @@ from agent import (
     ToolResultEvent,
     WorkspaceAgent,
 )
-from contracts import SessionSavedEvent
+from contracts import EventEnvelope, SessionSavedEvent
 from persistent_session import (
     PersistentSession,
     PersistentSessionOpenError,
@@ -1835,7 +1836,7 @@ def test_persistent_session_creates_and_saves_new_session(
 
     events = list(session.stream_turn("创建新会话"))
 
-    assert events == [
+    assert [envelope.event for envelope in events] == [
         TokenEvent(text="首次持久化回答。"),
         SessionSavedEvent(session_id="new-session"),
     ]
@@ -1901,21 +1902,21 @@ def test_persistent_session_forwards_approval_decisions(
     )
 
     stream = session.stream_turn("执行需要审批的工具")
-    call_event = next(stream)
-    approval_event = next(stream)
+    call_event = next(stream).event
+    approval_event = next(stream).event
     result_event = stream.send(
         ApprovalDecision(
             tool_call_id=approval_event.tool_call_id,
             approved=True,
         )
-    )
+    ).event
     remaining_events = list(stream)
 
     assert isinstance(call_event, ToolCallEvent)
     assert isinstance(approval_event, ApprovalRequiredEvent)
     assert result_event.status == "success"
     assert ECHO_EXECUTIONS == ["once"]
-    assert remaining_events == [
+    assert [envelope.event for envelope in remaining_events] == [
         TokenEvent(text="审批后的持久化回答。"),
         SessionSavedEvent(session_id="approval-session"),
     ]
@@ -1942,7 +1943,7 @@ def test_cancelled_or_incomplete_turn_is_not_saved(
     )
 
     stream = cancelled_session.stream_turn("取消本轮")
-    assert next(stream) == TokenEvent(text="尚未提交")
+    assert next(stream).event == TokenEvent(text="尚未提交")
     stream.close()
 
     assert cancelled_session.dirty is False
@@ -1956,9 +1957,10 @@ def test_cancelled_or_incomplete_turn_is_not_saved(
     events = list(incomplete_session.stream_turn("模型无响应"))
 
     assert len(events) == 1
-    assert isinstance(events[0], SystemEvent)
+    assert isinstance(events[0].event, SystemEvent)
     assert not any(
-        isinstance(event, SessionSavedEvent) for event in events
+        isinstance(envelope.event, SessionSavedEvent)
+        for envelope in events
     )
     assert incomplete_session.dirty is False
     assert session_store.list_sessions() == []
@@ -2007,7 +2009,8 @@ def test_save_failure_marks_dirty_and_flush_does_not_replay_tools(
     assert ECHO_EXECUTIONS == ["side-effect"]
     assert model.call_log == [True, True]
     assert not any(
-        isinstance(event, SessionSavedEvent) for event in events
+        isinstance(envelope.event, SessionSavedEvent)
+        for envelope in events
     )
 
     with pytest.raises(PersistentSessionSaveError, match="flush"):
@@ -2067,3 +2070,214 @@ def test_open_rejects_corrupt_or_semantically_invalid_snapshot(
 
     assert factory_calls == ["called"]
     assert semantic_file.read_bytes() == semantic_bytes
+
+
+def test_event_envelope_correlates_turn_and_orders_saved_event(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    session = PersistentSession(
+        "correlated",
+        WorkspaceAgent(
+            model=ScriptedModel(
+                [
+                    [
+                        AIMessageChunk(content="第一段"),
+                        AIMessageChunk(content="第二段"),
+                    ]
+                ]
+            ),
+            tools=[],
+        ),
+        turn_id_factory=lambda: "deterministic-turn",
+    )
+
+    envelopes = list(session.stream_turn("关联这一轮"))
+
+    assert all(
+        isinstance(envelope, EventEnvelope)
+        for envelope in envelopes
+    )
+    assert {
+        envelope.session_id for envelope in envelopes
+    } == {"correlated"}
+    assert {
+        envelope.turn_id for envelope in envelopes
+    } == {"deterministic-turn"}
+    assert [envelope.sequence for envelope in envelopes] == [1, 2, 3]
+    assert [envelope.event for envelope in envelopes[:-1]] == [
+        TokenEvent(text="第一段"),
+        TokenEvent(text="第二段"),
+    ]
+    assert envelopes[-1].event == SessionSavedEvent(
+        session_id="correlated"
+    )
+
+
+def test_event_envelope_default_factory_uses_new_uuid_per_turn(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    session = PersistentSession(
+        "uuid-turns",
+        WorkspaceAgent(
+            model=ScriptedModel(
+                [
+                    [AIMessageChunk(content="第一轮")],
+                    [AIMessageChunk(content="第二轮")],
+                ]
+            ),
+            tools=[],
+        ),
+    )
+
+    first_turn = list(session.stream_turn("问题一"))
+    second_turn = list(session.stream_turn("问题二"))
+    first_turn_id = first_turn[0].turn_id
+    second_turn_id = second_turn[0].turn_id
+
+    assert UUID(first_turn_id).version == 4
+    assert UUID(second_turn_id).version == 4
+    assert first_turn_id != second_turn_id
+    assert [item.sequence for item in first_turn] == [1, 2]
+    assert [item.sequence for item in second_turn] == [1, 2]
+
+
+def test_event_envelope_isolates_session_ids(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+
+    def make_session(session_id, answer):
+        return PersistentSession(
+            session_id,
+            WorkspaceAgent(
+                model=ScriptedModel(
+                    [[AIMessageChunk(content=answer)]]
+                ),
+                tools=[],
+            ),
+            turn_id_factory=lambda: "shared-test-turn-id",
+        )
+
+    first_events = list(
+        make_session("first-session", "第一会话").stream_turn("问题")
+    )
+    second_events = list(
+        make_session("second-session", "第二会话").stream_turn("问题")
+    )
+
+    assert {
+        envelope.session_id for envelope in first_events
+    } == {"first-session"}
+    assert {
+        envelope.session_id for envelope in second_events
+    } == {"second-session"}
+
+
+def test_event_envelope_forwards_approval_decision(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("enveloped-approval", "echo_test", '{"value":"approved"}'),
+            ),
+            [AIMessageChunk(content="审批完成")],
+        ]
+    )
+    session = PersistentSession(
+        "approval-envelope",
+        WorkspaceAgent(
+            model=model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+        ),
+        turn_id_factory=lambda: "approval-turn",
+    )
+
+    stream = session.stream_turn("执行审批工具")
+    call_envelope = next(stream)
+    approval_envelope = next(stream)
+    result_envelope = stream.send(
+        ApprovalDecision(
+            tool_call_id=(
+                approval_envelope.event.tool_call_id
+            ),
+            approved=True,
+        )
+    )
+    remaining = list(stream)
+    envelopes = [
+        call_envelope,
+        approval_envelope,
+        result_envelope,
+        *remaining,
+    ]
+
+    assert isinstance(call_envelope.event, ToolCallEvent)
+    assert isinstance(
+        approval_envelope.event,
+        ApprovalRequiredEvent,
+    )
+    assert result_envelope.event.status == "success"
+    assert ECHO_EXECUTIONS == ["approved"]
+    assert {
+        envelope.turn_id for envelope in envelopes
+    } == {"approval-turn"}
+    assert [envelope.sequence for envelope in envelopes] == list(
+        range(1, len(envelopes) + 1)
+    )
+    assert isinstance(envelopes[-1].event, SessionSavedEvent)
+
+
+def test_invalid_turn_ids_fail_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+
+    for invalid_turn_id in ["", None, "x" * 129]:
+        model = ScriptedModel(
+            [[AIMessageChunk(content="不应调用模型")]]
+        )
+        session = PersistentSession(
+            "invalid-turn-id",
+            WorkspaceAgent(model=model, tools=[]),
+            turn_id_factory=(
+                lambda value=invalid_turn_id: value
+            ),
+        )
+
+        with pytest.raises(ValueError, match="turn_id"):
+            list(session.stream_turn("不应开始"))
+
+        assert model.call_log == []
+        assert model.message_log == []
+        assert len(model.responses) == 1

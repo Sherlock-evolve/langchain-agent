@@ -13,6 +13,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ContextTrimmedEvent,
+    EventEnvelope,
     MemoryUpdatedEvent,
     SessionSavedEvent,
     SystemEvent,
@@ -146,11 +147,14 @@ def _drive_turn(
     try:
         while True:
             try:
-                event = stream.send(decision)
+                envelope = stream.send(decision)
             except StopIteration:
                 break
 
             decision = None
+            if not isinstance(envelope, EventEnvelope):
+                raise TypeError("持久会话返回了无效的事件信封")
+            event = envelope.event
             render_event(event)
 
             if isinstance(event, ApprovalRequiredEvent):
