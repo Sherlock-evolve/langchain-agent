@@ -15,6 +15,7 @@ from contracts import (
     ContextTrimmedEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
+    ModelCallMetricsEvent,
     SessionSavedEvent,
     SystemEvent,
     TokenEvent,
@@ -108,6 +109,29 @@ def render_event(event: AgentEvent) -> None:
         print(f"[上下文] 已移除 {event.removed_message_count} 条旧消息")
     elif isinstance(event, MemoryUpdatedEvent):
         print(f"[记忆] 长期摘要已更新，共 {event.character_count} 个字符")
+    elif isinstance(event, ModelCallMetricsEvent):
+        status_label = STATUS_LABELS[event.status]
+        first_chunk = (
+            f"{event.first_chunk_ms} ms"
+            if event.first_chunk_ms is not None
+            else "无"
+        )
+        tokens = (
+            f"{event.total_tokens}"
+            if event.token_source == "provider"
+            else "不可用"
+        )
+        error_label = (
+            f"，错误类型 {event.error_type}"
+            if event.error_type
+            else ""
+        )
+        print(
+            f"[模型调用 #{event.call_index}] {status_label}，"
+            f"耗时 {event.duration_ms} ms，"
+            f"首块 {first_chunk}，总 tokens {tokens}"
+            f"{error_label}"
+        )
     elif isinstance(event, SessionSavedEvent):
         print(f"[会话] 已保存：{event.session_id}")
 

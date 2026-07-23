@@ -1,4 +1,5 @@
 import json
+import time
 from collections.abc import Callable, Generator
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from contracts import (
     ApprovalRequiredEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
+    ModelCallMetricsEvent,
     PreparedToolAction,
     SessionSavedEvent,
     SystemEvent,
@@ -75,6 +77,7 @@ def _freeze(value):
 
 @dataclass
 class _TurnState:
+    model_call_count: int = 0
     tool_call_count: int = 0
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     tool_budget_exhausted: bool = False
@@ -101,6 +104,7 @@ class WorkspaceAgent:
         approval_preparers: (
             dict[str, Callable[..., PreparedToolAction]] | None
         ) = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ):
         configured_previewers = dict(approval_previewers or {})
         configured_preparers = dict(approval_preparers or {})
@@ -130,6 +134,13 @@ class WorkspaceAgent:
         self.approval_required_tools = set(approval_required_tools or ())
         self.approval_previewers = configured_previewers
         self.approval_preparers = configured_preparers
+        self.monotonic_clock = (
+            monotonic_clock
+            if monotonic_clock is not None
+            else time.monotonic
+        )
+        if not callable(self.monotonic_clock):
+            raise TypeError("monotonic_clock 必须可调用")
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
@@ -359,9 +370,11 @@ class WorkspaceAgent:
                 and not state.tool_result_budget_exhausted
             )
             active_model = self.model_with_tools if tools_allowed else self.model
+            state.model_call_count += 1
             response = yield from self._stream_response(
                 active_model,
                 working_messages,
+                call_index=state.model_call_count,
             )
 
             if response is None:
@@ -675,27 +688,127 @@ class WorkspaceAgent:
         self,
         active_model,
         working_messages: list,
+        call_index: int,
     ) -> Generator[AgentEvent, None, AIMessage | None]:
         response_chunk = None
+        started_at = self.monotonic_clock()
+        first_chunk_at = None
 
-        for chunk in active_model.stream(working_messages):
-            if isinstance(chunk.content, str):
-                text = chunk.content
-            else:
-                text = chunk.text
+        try:
+            for chunk in active_model.stream(working_messages):
+                if first_chunk_at is None:
+                    first_chunk_at = self.monotonic_clock()
 
-            if text:
-                yield TokenEvent(text=text)
+                if isinstance(chunk.content, str):
+                    text = chunk.content
+                else:
+                    text = chunk.text
 
-            if response_chunk is None:
-                response_chunk = chunk
-            else:
-                response_chunk = response_chunk + chunk
+                if text:
+                    yield TokenEvent(text=text)
 
+                if response_chunk is None:
+                    response_chunk = chunk
+                else:
+                    response_chunk = response_chunk + chunk
+
+            response = self._message_from_response_chunk(response_chunk)
+            finished_at = self.monotonic_clock()
+            input_tokens, output_tokens, total_tokens, token_source = (
+                self._extract_usage_metadata(response)
+            )
+            yield ModelCallMetricsEvent(
+                call_index=call_index,
+                status="success",
+                duration_ms=self._elapsed_ms(
+                    started_at,
+                    finished_at,
+                ),
+                first_chunk_ms=(
+                    self._elapsed_ms(started_at, first_chunk_at)
+                    if first_chunk_at is not None
+                    else None
+                ),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                token_source=token_source,
+            )
+            return response
+        except Exception as error:
+            finished_at = self.monotonic_clock()
+            yield ModelCallMetricsEvent(
+                call_index=call_index,
+                status="error",
+                duration_ms=self._elapsed_ms(
+                    started_at,
+                    finished_at,
+                ),
+                first_chunk_ms=(
+                    self._elapsed_ms(started_at, first_chunk_at)
+                    if first_chunk_at is not None
+                    else None
+                ),
+                input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                token_source="unavailable",
+                error_type=type(error).__name__,
+            )
+            raise
+
+    @staticmethod
+    def _elapsed_ms(started_at: float, finished_at: float) -> int:
+        return int(round(max(0.0, finished_at - started_at) * 1000))
+
+    @classmethod
+    def _message_from_response_chunk(cls, response_chunk):
         if response_chunk is None:
             return None
 
+        usage = getattr(response_chunk, "usage_metadata", None)
+        if (
+            usage is not None
+            and cls._validated_usage_metadata(usage) is None
+        ):
+            response_chunk = response_chunk.model_copy(
+                update={"usage_metadata": None}
+            )
         return message_chunk_to_message(response_chunk)
+
+    @classmethod
+    def _extract_usage_metadata(
+        cls,
+        response: AIMessage | None,
+    ) -> tuple[int | None, int | None, int | None, str]:
+        usage = (
+            getattr(response, "usage_metadata", None)
+            if response is not None
+            else None
+        )
+        token_values = cls._validated_usage_metadata(usage)
+        if token_values is None:
+            return None, None, None, "unavailable"
+        return *token_values, "provider"
+
+    @staticmethod
+    def _validated_usage_metadata(
+        usage,
+    ) -> tuple[int, int, int] | None:
+        if not isinstance(usage, dict):
+            return None
+        token_keys = (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+        )
+        token_values = tuple(usage.get(key) for key in token_keys)
+        if any(
+            type(value) is not int or value < 0
+            for value in token_values
+        ):
+            return None
+        return token_values
 
     def _execute_tool_call(
         self,

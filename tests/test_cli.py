@@ -329,7 +329,12 @@ def test_cli_closes_active_approval_stream_on_exit_signals(
         assert status == expected_status
         assert CLI_TOOL_EXECUTIONS == []
         assert session_store.list_sessions() == []
-        assert list(agent.stream_turn("验证锁释放")) == [
+        next_events = list(agent.stream_turn("验证锁释放"))
+        assert [
+            event
+            for event in next_events
+            if not isinstance(event, cli.ModelCallMetricsEvent)
+        ] == [
             cli.TokenEvent(text="锁已释放。")
         ]
 

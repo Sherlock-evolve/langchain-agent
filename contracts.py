@@ -67,6 +67,19 @@ class MemoryUpdatedEvent:
 
 
 @dataclass(frozen=True)
+class ModelCallMetricsEvent:
+    call_index: int
+    status: Literal["success", "error"]
+    duration_ms: int
+    first_chunk_ms: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    token_source: Literal["provider", "unavailable"]
+    error_type: str = ""
+
+
+@dataclass(frozen=True)
 class SessionSavedEvent:
     session_id: str
 
@@ -79,6 +92,7 @@ AgentEvent = (
     | SystemEvent
     | ContextTrimmedEvent
     | MemoryUpdatedEvent
+    | ModelCallMetricsEvent
     | SessionSavedEvent
 )
 
