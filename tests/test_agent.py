@@ -1,3 +1,4 @@
+import json
 from collections import deque
 
 from langchain_core.messages import (
@@ -308,6 +309,147 @@ def test_tool_budget_is_enforced():
     assert "工具预算已耗尽" in tool_messages[1].content
     assert ECHO_EXECUTIONS == ["first"]
     assert model.call_log == [True, False]
+
+
+def test_single_large_tool_result_is_truncated_and_disables_tools():
+    ECHO_EXECUTIONS.clear()
+    large_result = "x" * 50
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "call-large",
+                    "echo_test",
+                    json.dumps({"value": large_result}),
+                ),
+            ),
+            [AIMessageChunk(content="根据截断结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        max_tool_result_characters=24,
+    )
+
+    events = list(agent.stream_turn("读取超长工具结果"))
+
+    result_events = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    tool_messages = [
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    ]
+    assert len(result_events) == 1
+    assert result_events[0].status == "success"
+    assert result_events[0].character_count == 24
+    assert result_events[0].truncated is True
+    assert len(tool_messages[0].content) == 24
+    assert tool_messages[0].content.endswith("[工具结果已截断]")
+    assert ECHO_EXECUTIONS == [large_result]
+    assert model.call_log == [True, False]
+
+
+def test_parallel_tool_results_share_one_character_budget():
+    ECHO_EXECUTIONS.clear()
+    first_result = "first123"
+    second_result = "y" * 30
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "call-first",
+                    "echo_test",
+                    json.dumps({"value": first_result}),
+                ),
+                (
+                    "call-second",
+                    "echo_test",
+                    json.dumps({"value": second_result}),
+                ),
+                (
+                    "call-skipped",
+                    "echo_test",
+                    json.dumps({"value": "not-executed"}),
+                ),
+            ),
+            [AIMessageChunk(content="根据累计预算内结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        max_tool_result_characters=20,
+    )
+
+    events = list(agent.stream_turn("并行工具结果预算测试"))
+
+    result_events = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    tool_messages = [
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    ]
+    assert [event.status for event in result_events] == [
+        "success",
+        "success",
+        "skipped",
+    ]
+    assert [event.character_count for event in result_events] == [8, 12, 0]
+    assert [event.truncated for event in result_events] == [
+        False,
+        True,
+        False,
+    ]
+    assert result_events[2].detail == "工具结果预算已耗尽"
+    assert sum(len(message.content) for message in tool_messages[:2]) == 20
+    assert [message.tool_call_id for message in tool_messages] == [
+        "call-first",
+        "call-second",
+        "call-skipped",
+    ]
+    assert "工具结果预算已耗尽" in tool_messages[2].content
+    assert tool_messages[2].content != ""
+    assert ECHO_EXECUTIONS == [first_result, second_result]
+    assert model.call_log == [True, False]
+
+
+def test_small_tool_result_does_not_exhaust_character_budget():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "call-small",
+                    "echo_test",
+                    json.dumps({"value": "small"}),
+                ),
+            ),
+            [AIMessageChunk(content="根据完整结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        max_agent_loops=3,
+        max_tool_result_characters=20,
+    )
+
+    events = list(agent.stream_turn("小工具结果测试"))
+
+    result_events = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    assert len(result_events) == 1
+    assert result_events[0].status == "success"
+    assert result_events[0].character_count == len("small")
+    assert result_events[0].truncated is False
+    assert ECHO_EXECUTIONS == ["small"]
+    assert model.call_log == [True, True]
 
 
 def test_last_step_disables_tools():

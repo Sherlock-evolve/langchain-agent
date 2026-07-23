@@ -20,6 +20,7 @@ SYSTEM_PROMPT = (
     "需要了解项目文件时，请使用工具获取真实信息，不要猜测。"
     "请用通俗、准确的方式回答。"
 )
+TOOL_RESULT_TRUNCATION_MARKER = "\n[工具结果已截断]"
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class ToolResultEvent:
     status: Literal["success", "error", "skipped"]
     character_count: int
     detail: str = ""
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,8 @@ class _TurnState:
     tool_call_count: int = 0
     seen_tool_calls: set[tuple[str, str]] = field(default_factory=set)
     tool_budget_exhausted: bool = False
+    tool_result_character_count: int = 0
+    tool_result_budget_exhausted: bool = False
 
 
 class WorkspaceAgent:
@@ -112,6 +116,7 @@ class WorkspaceAgent:
         tools,
         max_agent_loops=5,
         max_tool_calls=8,
+        max_tool_result_characters=12_000,
         max_context_tokens=6000,
         token_counter="approximate",
         summary_model=None,
@@ -121,6 +126,10 @@ class WorkspaceAgent:
         self.tools = list(tools)
         self.max_agent_loops = max_agent_loops
         self.max_tool_calls = max_tool_calls
+        self.max_tool_result_characters = max(
+            0,
+            max_tool_result_characters,
+        )
         self.max_context_tokens = max_context_tokens
         self.token_counter = token_counter
         self.summary_model = summary_model if summary_model is not None else model
@@ -213,6 +222,7 @@ class WorkspaceAgent:
             tools_allowed = (
                 step < self.max_agent_loops
                 and not state.tool_budget_exhausted
+                and not state.tool_result_budget_exhausted
             )
             active_model = self.model_with_tools if tools_allowed else self.model
             response = yield from self._stream_response(
@@ -539,7 +549,7 @@ class WorkspaceAgent:
 
         if not tools_allowed:
             detail = "当前轮次禁止调用工具"
-            self._append_tool_message(
+            self._append_control_tool_message(
                 messages=working_messages,
                 content=(
                     "当前轮次不允许调用工具，本次调用未执行。"
@@ -556,9 +566,33 @@ class WorkspaceAgent:
             )
             return
 
+        if (
+            state.tool_result_budget_exhausted
+            or state.tool_result_character_count
+            >= self.max_tool_result_characters
+        ):
+            state.tool_result_budget_exhausted = True
+            detail = "工具结果预算已耗尽"
+            self._append_control_tool_message(
+                messages=working_messages,
+                content=(
+                    "工具结果预算已耗尽，本次调用未执行。"
+                    "请根据已有信息回答。"
+                ),
+                tool_call_id=tool_call_id,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="skipped",
+                character_count=0,
+                detail=detail,
+            )
+            return
+
         if signature in state.seen_tool_calls:
             detail = "重复调用"
-            self._append_tool_message(
+            self._append_control_tool_message(
                 messages=working_messages,
                 content="重复工具调用已跳过，请使用之前相同工具调用的结果。",
                 tool_call_id=tool_call_id,
@@ -577,7 +611,7 @@ class WorkspaceAgent:
         if state.tool_call_count >= self.max_tool_calls:
             state.tool_budget_exhausted = True
             detail = "工具预算已耗尽"
-            self._append_tool_message(
+            self._append_control_tool_message(
                 messages=working_messages,
                 content=(
                     "工具预算已耗尽，本次调用未执行。"
@@ -606,20 +640,53 @@ class WorkspaceAgent:
             tool_result_text = f"工具执行失败：{error}"
             tool_status = "error"
 
-        self._append_tool_message(
+        character_count, truncated = self._append_tool_message(
             messages=working_messages,
             content=tool_result_text,
             tool_call_id=tool_call_id,
+            state=state,
         )
         yield ToolResultEvent(
             tool_call_id=tool_call_id,
             name=tool_name,
             status=tool_status,
-            character_count=len(tool_result_text),
+            character_count=character_count,
+            truncated=truncated,
         )
 
-    @staticmethod
     def _append_tool_message(
+        self,
+        messages: list,
+        content: str,
+        tool_call_id: str,
+        state: _TurnState,
+    ) -> tuple[int, bool]:
+        remaining_characters = max(
+            0,
+            self.max_tool_result_characters
+            - state.tool_result_character_count,
+        )
+        limited_content, truncated = self._limit_tool_result(
+            content,
+            remaining_characters,
+        )
+        messages.append(
+            ToolMessage(
+                content=limited_content,
+                tool_call_id=tool_call_id,
+            )
+        )
+        character_count = len(limited_content)
+        state.tool_result_character_count += character_count
+        if (
+            state.tool_result_character_count
+            >= self.max_tool_result_characters
+        ):
+            state.tool_result_budget_exhausted = True
+        return character_count, truncated
+
+    @staticmethod
+    def _append_control_tool_message(
         messages: list,
         content: str,
         tool_call_id: str,
@@ -630,3 +697,20 @@ class WorkspaceAgent:
                 tool_call_id=tool_call_id,
             )
         )
+
+    @staticmethod
+    def _limit_tool_result(
+        content: str,
+        remaining_characters: int,
+    ) -> tuple[str, bool]:
+        if len(content) <= remaining_characters:
+            return content, False
+        if remaining_characters <= 0:
+            return "", True
+
+        marker = TOOL_RESULT_TRUNCATION_MARKER
+        if remaining_characters <= len(marker):
+            return marker[-remaining_characters:], True
+
+        prefix_length = remaining_characters - len(marker)
+        return f"{content[:prefix_length]}{marker}", True

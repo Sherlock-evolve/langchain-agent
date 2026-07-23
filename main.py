@@ -62,9 +62,11 @@ def render_event(event: AgentEvent) -> None:
             print(f"[工具跳过] {event.detail}")
         else:
             status_label = STATUS_LABELS[event.status]
+            truncated_label = "（已截断）" if event.truncated else ""
             print(
                 f"[工具结果] {status_label}，"
                 f"返回 {event.character_count} 个字符"
+                f"{truncated_label}"
             )
     elif isinstance(event, SystemEvent):
         print(f"[系统] {event.message}")
