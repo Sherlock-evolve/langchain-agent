@@ -13,6 +13,7 @@ from agent import TokenEvent, ToolCallEvent, ToolResultEvent, WorkspaceAgent
 
 
 TOOL_EXECUTIONS = []
+ECHO_EXECUTIONS = []
 
 
 @tool
@@ -20,6 +21,13 @@ def read_test_note() -> str:
     """读取测试笔记内容。"""
     TOOL_EXECUTIONS.append("read_test_note")
     return "测试笔记内容"
+
+
+@tool
+def echo_test(value: str) -> str:
+    """返回测试输入。"""
+    ECHO_EXECUTIONS.append(value)
+    return value
 
 
 class ScriptedModel:
@@ -74,6 +82,23 @@ def tool_call_response(tool_call_id):
                 }
             ],
         ),
+    ]
+
+
+def parallel_tool_call_response(*tool_calls):
+    return [
+        AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {
+                    "name": name,
+                    "args": args,
+                    "id": tool_call_id,
+                    "index": index,
+                }
+                for index, (tool_call_id, name, args) in enumerate(tool_calls)
+            ],
+        )
     ]
 
 
@@ -184,3 +209,145 @@ def test_cancelled_stream_does_not_commit_history():
         AIMessage,
     ]
     assert list(model.responses) == []
+
+
+def test_duplicate_tool_call_is_skipped():
+    TOOL_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("call-1", "read_test_note", "{}"),
+                ("call-2", "read_test_note", "{}"),
+            ),
+            [AIMessageChunk(content="已使用首次结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(model=model, tools=[read_test_note])
+
+    events = list(agent.stream_turn("重复调用测试"))
+
+    result_events = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    tool_messages = [
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    ]
+    assert len(result_events) == 2
+    assert [event.tool_call_id for event in result_events] == [
+        "call-1",
+        "call-2",
+    ]
+    assert result_events[0].status == "success"
+    assert result_events[0].detail == ""
+    assert result_events[1].status == "skipped"
+    assert result_events[1].detail == "重复调用"
+    assert len(tool_messages) == 2
+    assert [message.tool_call_id for message in tool_messages] == [
+        "call-1",
+        "call-2",
+    ]
+    assert tool_messages[0].content == "测试笔记内容"
+    assert "重复工具调用已跳过" in tool_messages[1].content
+    assert TOOL_EXECUTIONS == ["read_test_note"]
+
+
+def test_tool_budget_is_enforced():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("call-1", "echo_test", '{"value":"first"}'),
+                ("call-2", "echo_test", '{"value":"second"}'),
+            ),
+            [AIMessageChunk(content="根据预算内结果回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        max_tool_calls=1,
+    )
+
+    events = list(agent.stream_turn("预算测试"))
+
+    call_events = [
+        event for event in events if isinstance(event, ToolCallEvent)
+    ]
+    result_events = [
+        event for event in events if isinstance(event, ToolResultEvent)
+    ]
+    tool_messages = [
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    ]
+    assert [event.args["value"] for event in call_events] == [
+        "first",
+        "second",
+    ]
+    assert [event.status for event in result_events] == [
+        "success",
+        "skipped",
+    ]
+    assert result_events[1].detail == "工具预算已耗尽"
+    assert len(tool_messages) == 2
+    assert "工具预算已耗尽" in tool_messages[1].content
+    assert ECHO_EXECUTIONS == ["first"]
+    assert model.call_log == [True, False]
+
+
+def test_last_step_disables_tools():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("call-1", "echo_test", '{"value":"only"}'),
+            ),
+            [AIMessageChunk(content="最后一轮直接回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        max_agent_loops=2,
+        max_tool_calls=8,
+    )
+
+    events = list(agent.stream_turn("最后一轮测试"))
+
+    assert model.call_log == [True, False]
+    assert ECHO_EXECUTIONS == ["only"]
+    assert [
+        event.status
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    ] == ["success"]
+    assert events[-1] == TokenEvent(text="最后一轮直接回答。")
+
+
+def test_agents_do_not_share_history():
+    first_model = ScriptedModel(
+        [[AIMessageChunk(content="第一个 Agent 的回答。")]]
+    )
+    second_model = ScriptedModel(
+        [[AIMessageChunk(content="未使用的回答。")]]
+    )
+    first_agent = WorkspaceAgent(model=first_model, tools=[])
+    second_agent = WorkspaceAgent(model=second_model, tools=[])
+
+    list(first_agent.stream_turn("只运行第一个 Agent"))
+
+    assert [type(message) for message in first_agent.messages] == [
+        SystemMessage,
+        HumanMessage,
+        AIMessage,
+    ]
+    assert [type(message) for message in second_agent.messages] == [
+        SystemMessage,
+    ]
+    assert first_agent.messages is not second_agent.messages
+    assert first_model.call_log == [True]
+    assert second_model.call_log == []
+    assert len(second_model.responses) == 1
