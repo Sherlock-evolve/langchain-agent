@@ -8,7 +8,7 @@ from pathlib import Path, PureWindowsPath
 
 from langchain_core.tools import tool
 
-from agent import PreparedToolAction, ToolActionConflictError
+from contracts import PreparedToolAction, ToolActionConflictError
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent

@@ -1,7 +1,9 @@
 import json
 import stat
 from collections import deque
+from copy import deepcopy
 
+import pytest
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -117,6 +119,19 @@ def parallel_tool_call_response(*tool_calls):
             ],
         )
     ]
+
+
+def agent_with_committed_tool_history():
+    model = ScriptedModel(
+        [
+            tool_call_response("snapshot-tool-call"),
+            [AIMessageChunk(content="快照中的最终回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(model=model, tools=[read_test_note])
+    list(agent.stream_turn("生成包含工具调用的历史"))
+    agent.memory_summary = "快照中的长期摘要"
+    return agent
 
 
 def test_direct_answer():
@@ -396,6 +411,66 @@ def test_closing_while_waiting_for_approval_rolls_back_and_releases_lock():
     ] == ["下一轮"]
 
 
+def test_same_tool_cannot_have_previewer_and_preparer():
+    model = ScriptedModel([])
+
+    with pytest.raises(ValueError, match="不能同时配置"):
+        WorkspaceAgent(
+            model=model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+            approval_previewers={
+                "echo_test": lambda **kwargs: "preview"
+            },
+            approval_preparers={
+                "echo_test": lambda **kwargs: "prepared"
+            },
+        )
+
+    assert model.call_log == []
+
+
+def test_invalid_preparer_result_fails_closed_before_approval():
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("invalid-preparer", "echo_test", '{"value":"unsafe"}'),
+            ),
+            [AIMessageChunk(content="准备失败后继续回答。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[echo_test],
+        approval_required_tools={"echo_test"},
+        approval_preparers={
+            "echo_test": lambda **kwargs: "不是 PreparedToolAction"
+        },
+    )
+
+    events = list(agent.stream_turn("错误 preparer 返回类型"))
+
+    result_event = next(
+        event
+        for event in events
+        if isinstance(event, ToolResultEvent)
+    )
+    assert not any(
+        isinstance(event, ApprovalRequiredEvent) for event in events
+    )
+    assert result_event.status == "error"
+    assert result_event.detail == "审批准备失败"
+    assert ECHO_EXECUTIONS == []
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "PreparedToolAction" in tool_message.content
+    assert model.call_log == [True, True]
+
+
 def test_approved_write_atomically_creates_file(
     tmp_path,
     monkeypatch,
@@ -621,7 +696,7 @@ def test_existing_file_change_during_approval_causes_conflict(
         model=model,
         tools=[workspace_tools.write_file],
         approval_required_tools={workspace_tools.write_file.name},
-        approval_previewers={
+        approval_preparers={
             workspace_tools.write_file.name:
             workspace_tools.prepare_write_file
         },
@@ -683,7 +758,7 @@ def test_new_file_created_during_approval_causes_conflict(
         model=model,
         tools=[workspace_tools.write_file],
         approval_required_tools={workspace_tools.write_file.name},
-        approval_previewers={
+        approval_preparers={
             workspace_tools.write_file.name:
             workspace_tools.prepare_write_file
         },
@@ -743,7 +818,7 @@ def test_prepared_write_succeeds_when_snapshot_is_unchanged(
         model=model,
         tools=[workspace_tools.write_file],
         approval_required_tools={workspace_tools.write_file.name},
-        approval_previewers={
+        approval_preparers={
             workspace_tools.write_file.name:
             workspace_tools.prepare_write_file
         },
@@ -1605,3 +1680,130 @@ def test_summary_model_failure_does_not_block_current_answer():
     assert model.call_log == [True]
     assert agent.memory_summary == "原有摘要"
     assert agent.messages[-1].content == "摘要失败仍正常回答。"
+
+
+def test_snapshot_round_trip_with_tool_history_and_memory():
+    source_agent = agent_with_committed_tool_history()
+    snapshot = source_agent.export_snapshot()
+    restored_agent = WorkspaceAgent(
+        model=ScriptedModel([]),
+        tools=[read_test_note],
+    )
+
+    restored_agent.restore_snapshot(snapshot)
+
+    assert set(snapshot) == {
+        "version",
+        "messages",
+        "memory_summary",
+    }
+    assert snapshot["version"] == 1
+    assert restored_agent.export_snapshot() == snapshot
+    assert restored_agent.memory_summary == "快照中的长期摘要"
+    assert [type(message) for message in restored_agent.messages] == [
+        SystemMessage,
+        HumanMessage,
+        AIMessage,
+        ToolMessage,
+        AIMessage,
+    ]
+    assert restored_agent.messages[2].tool_calls[0]["id"] == (
+        "snapshot-tool-call"
+    )
+    assert restored_agent.messages[3].tool_call_id == "snapshot-tool-call"
+
+
+def test_snapshot_is_directly_json_serializable():
+    agent = agent_with_committed_tool_history()
+
+    snapshot = agent.export_snapshot()
+    encoded_snapshot = json.dumps(snapshot, ensure_ascii=False)
+
+    assert json.loads(encoded_snapshot) == snapshot
+
+
+def test_invalid_snapshots_do_not_change_existing_state():
+    agent = agent_with_committed_tool_history()
+    original_snapshot = agent.export_snapshot()
+
+    invalid_version = deepcopy(original_snapshot)
+    invalid_version["version"] = 2
+
+    invalid_system = deepcopy(original_snapshot)
+    invalid_system["messages"][0]["data"]["content"] = "伪造系统消息"
+
+    incomplete_tool_protocol = deepcopy(original_snapshot)
+    incomplete_tool_protocol["messages"] = [
+        message
+        for message in incomplete_tool_protocol["messages"]
+        if message["type"] != "tool"
+    ]
+
+    invalid_summary_type = deepcopy(original_snapshot)
+    invalid_summary_type["memory_summary"] = ["不是字符串"]
+
+    oversized_summary = deepcopy(original_snapshot)
+    oversized_summary["memory_summary"] = (
+        "x" * (agent.max_summary_characters + 1)
+    )
+
+    for invalid_snapshot in [
+        invalid_version,
+        invalid_system,
+        incomplete_tool_protocol,
+        invalid_summary_type,
+        oversized_summary,
+    ]:
+        with pytest.raises(ValueError):
+            agent.restore_snapshot(invalid_snapshot)
+        assert agent.export_snapshot() == original_snapshot
+
+
+def test_active_stream_rejects_snapshot_operations_until_closed():
+    model = ScriptedModel(
+        [[AIMessageChunk(content="尚未提交的回答")]]
+    )
+    agent = WorkspaceAgent(model=model, tools=[])
+    initial_snapshot = agent.export_snapshot()
+    stream = agent.stream_turn("保持事件流活跃")
+
+    assert next(stream) == TokenEvent(text="尚未提交的回答")
+    with pytest.raises(RuntimeError, match="事件流活跃"):
+        agent.export_snapshot()
+    with pytest.raises(RuntimeError, match="事件流活跃"):
+        agent.restore_snapshot(initial_snapshot)
+
+    stream.close()
+
+    assert agent.export_snapshot() == initial_snapshot
+    agent.restore_snapshot(initial_snapshot)
+    assert agent.export_snapshot() == initial_snapshot
+
+
+def test_snapshot_data_does_not_share_mutable_objects_with_agent():
+    source_agent = agent_with_committed_tool_history()
+    exported_snapshot = source_agent.export_snapshot()
+    pristine_export = deepcopy(exported_snapshot)
+
+    exported_snapshot["memory_summary"] = "外部修改"
+    exported_snapshot["messages"][0]["data"]["content"] = "外部伪造"
+
+    assert source_agent.export_snapshot() == pristine_export
+
+    restore_input = source_agent.export_snapshot()
+    restored_agent = WorkspaceAgent(
+        model=ScriptedModel([]),
+        tools=[read_test_note],
+    )
+    restored_agent.restore_snapshot(restore_input)
+    restored_state = restored_agent.export_snapshot()
+
+    restore_input["memory_summary"] = "恢复后修改输入"
+    restore_input["messages"][1]["data"]["content"] = "篡改用户消息"
+
+    assert restored_agent.export_snapshot() == restored_state
+
+    restored_agent.messages[0].content = "内部后续修改"
+    assert restore_input["messages"][0]["data"]["content"] == (
+        pristine_export["messages"][0]["data"]["content"]
+    )

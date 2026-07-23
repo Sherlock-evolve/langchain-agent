@@ -4,7 +4,8 @@ import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from agent import (
+from agent import WorkspaceAgent
+from contracts import (
     AgentEvent,
     ApprovalDecision,
     ApprovalRequiredEvent,
@@ -14,7 +15,6 @@ from agent import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
-    WorkspaceAgent,
 )
 from tools import (
     list_files,
@@ -109,7 +109,7 @@ def main() -> None:
         model=model,
         tools=[list_files, read_file, search_text, write_file],
         approval_required_tools={write_file.name},
-        approval_previewers={write_file.name: prepare_write_file},
+        approval_preparers={write_file.name: prepare_write_file},
     )
 
     while True:

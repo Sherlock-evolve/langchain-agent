@@ -3,7 +3,6 @@ from collections.abc import Callable, Generator
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -11,7 +10,23 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
     message_chunk_to_message,
+    messages_from_dict,
+    messages_to_dict,
     trim_messages,
+)
+
+from contracts import (
+    AgentEvent,
+    ApprovalDecision,
+    ApprovalRequiredEvent,
+    ContextTrimmedEvent,
+    MemoryUpdatedEvent,
+    PreparedToolAction,
+    SystemEvent,
+    TokenEvent,
+    ToolActionConflictError,
+    ToolCallEvent,
+    ToolResultEvent,
 )
 
 
@@ -21,6 +36,7 @@ SYSTEM_PROMPT = (
     "请用通俗、准确的方式回答。"
 )
 TOOL_RESULT_TRUNCATION_MARKER = "\n[工具结果已截断]"
+SNAPSHOT_VERSION = 1
 REDACTED_ARGUMENT_NAMES = {
     "api_key",
     "content",
@@ -28,80 +44,6 @@ REDACTED_ARGUMENT_NAMES = {
     "secret",
     "token",
 }
-
-
-@dataclass(frozen=True)
-class TokenEvent:
-    text: str
-
-
-@dataclass(frozen=True)
-class ToolCallEvent:
-    tool_call_id: str
-    step: int
-    name: str
-    args: dict
-
-
-@dataclass(frozen=True)
-class ToolResultEvent:
-    tool_call_id: str
-    name: str
-    status: Literal["success", "error", "skipped"]
-    character_count: int
-    detail: str = ""
-    truncated: bool = False
-
-
-@dataclass(frozen=True)
-class ApprovalRequiredEvent:
-    tool_call_id: str
-    tool_name: str
-    args: dict
-    preview: str = ""
-
-
-@dataclass(frozen=True)
-class ApprovalDecision:
-    tool_call_id: str
-    approved: bool
-
-
-@dataclass(frozen=True)
-class PreparedToolAction:
-    preview: str
-    execute: Callable[[], str]
-
-
-class ToolActionConflictError(RuntimeError):
-    """工具预览后的目标状态发生变化。"""
-
-
-@dataclass(frozen=True)
-class SystemEvent:
-    message: str
-
-
-@dataclass(frozen=True)
-class ContextTrimmedEvent:
-    removed_message_count: int
-    remaining_message_count: int
-
-
-@dataclass(frozen=True)
-class MemoryUpdatedEvent:
-    character_count: int
-
-
-AgentEvent = (
-    TokenEvent
-    | ToolCallEvent
-    | ToolResultEvent
-    | ApprovalRequiredEvent
-    | SystemEvent
-    | ContextTrimmedEvent
-    | MemoryUpdatedEvent
-)
 
 
 class _FrozenDict(dict):
@@ -154,8 +96,24 @@ class WorkspaceAgent:
         summary_model=None,
         max_summary_characters=2000,
         approval_required_tools: set[str] | None = None,
-        approval_previewers: dict[str, Callable] | None = None,
+        approval_previewers: dict[str, Callable[..., str]] | None = None,
+        approval_preparers: (
+            dict[str, Callable[..., PreparedToolAction]] | None
+        ) = None,
     ):
+        configured_previewers = dict(approval_previewers or {})
+        configured_preparers = dict(approval_preparers or {})
+        overlapping_handlers = (
+            configured_previewers.keys()
+            & configured_preparers.keys()
+        )
+        if overlapping_handlers:
+            tool_names = ", ".join(sorted(overlapping_handlers))
+            raise ValueError(
+                "同一工具不能同时配置 approval_previewer "
+                f"和 approval_preparer：{tool_names}"
+            )
+
         self.model = model
         self.tools = list(tools)
         self.max_agent_loops = max_agent_loops
@@ -169,12 +127,145 @@ class WorkspaceAgent:
         self.summary_model = summary_model if summary_model is not None else model
         self.max_summary_characters = max_summary_characters
         self.approval_required_tools = set(approval_required_tools or ())
-        self.approval_previewers = dict(approval_previewers or {})
+        self.approval_previewers = configured_previewers
+        self.approval_preparers = configured_preparers
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
         self.memory_summary = ""
         self._turn_lock = Lock()
+
+    def export_snapshot(self) -> dict:
+        """导出当前已提交会话状态的 JSON 可序列化副本。"""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError("事件流活跃时不能导出会话快照")
+
+        try:
+            snapshot = {
+                "version": SNAPSHOT_VERSION,
+                "messages": messages_to_dict(self.messages),
+                "memory_summary": self.memory_summary,
+            }
+            try:
+                return json.loads(
+                    json.dumps(
+                        snapshot,
+                        ensure_ascii=False,
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "当前会话包含无法 JSON 序列化的消息"
+                ) from error
+        finally:
+            self._turn_lock.release()
+
+    def restore_snapshot(self, snapshot: dict) -> None:
+        """完整验证后原子恢复已提交的会话状态。"""
+        if not self._turn_lock.acquire(blocking=False):
+            raise RuntimeError("事件流活跃时不能恢复会话快照")
+
+        try:
+            restored_messages, restored_summary = (
+                self._validate_snapshot(snapshot)
+            )
+            self.messages = restored_messages
+            self.memory_summary = restored_summary
+        finally:
+            self._turn_lock.release()
+
+    def _validate_snapshot(self, snapshot: dict) -> tuple[list, str]:
+        if not isinstance(snapshot, dict):
+            raise ValueError("会话快照必须是字典")
+
+        try:
+            candidate = deepcopy(snapshot)
+        except Exception as error:
+            raise ValueError("无法复制会话快照") from error
+
+        required_keys = {
+            "version",
+            "messages",
+            "memory_summary",
+        }
+        if set(candidate) != required_keys:
+            raise ValueError("会话快照字段不完整或包含未知字段")
+        if (
+            type(candidate["version"]) is not int
+            or candidate["version"] != SNAPSHOT_VERSION
+        ):
+            raise ValueError("不支持的会话快照版本")
+
+        restored_summary = candidate["memory_summary"]
+        if not isinstance(restored_summary, str):
+            raise ValueError("长期摘要必须是字符串")
+        if len(restored_summary) > self.max_summary_characters:
+            raise ValueError("长期摘要超过允许的长度")
+
+        serialized_messages = candidate["messages"]
+        if not isinstance(serialized_messages, list):
+            raise ValueError("会话消息必须是列表")
+        try:
+            restored_messages = messages_from_dict(serialized_messages)
+        except Exception as error:
+            raise ValueError("会话消息无法反序列化") from error
+
+        if not restored_messages:
+            raise ValueError("会话快照缺少系统消息")
+        if not self._is_current_system_message(
+            restored_messages[0],
+            restored_summary,
+        ):
+            raise ValueError("会话快照的第一条消息不是当前系统消息")
+        if any(
+            isinstance(message, SystemMessage)
+            for message in restored_messages[1:]
+        ):
+            raise ValueError("会话快照包含额外的系统消息")
+
+        allowed_message_types = (
+            SystemMessage,
+            HumanMessage,
+            AIMessage,
+            ToolMessage,
+        )
+        if any(
+            not isinstance(message, allowed_message_types)
+            for message in restored_messages
+        ):
+            raise ValueError("会话快照包含不支持的消息类型")
+        if not self._has_complete_tool_groups(restored_messages):
+            raise ValueError("会话快照中的工具调用协议不完整")
+        if not self._has_only_committed_turns(restored_messages):
+            raise ValueError("会话快照包含未完成的对话轮次")
+
+        return deepcopy(restored_messages), restored_summary
+
+    def _is_current_system_message(
+        self,
+        message,
+        memory_summary: str,
+    ) -> bool:
+        if (
+            not isinstance(message, SystemMessage)
+            or not isinstance(message.content, str)
+        ):
+            return False
+        if message.content == SYSTEM_PROMPT:
+            return True
+
+        summary_header = f"{SYSTEM_PROMPT}\n\n长期记忆摘要：\n"
+        if not message.content.startswith(summary_header):
+            return False
+
+        embedded_summary = message.content[len(summary_header):]
+        allowed_summary = memory_summary[
+            : max(0, self.max_summary_characters)
+        ]
+        return (
+            bool(embedded_summary)
+            and allowed_summary.startswith(embedded_summary)
+        )
 
     def stream_turn(
         self,
@@ -536,6 +627,49 @@ class WorkspaceAgent:
 
         return not pending_tool_call_ids
 
+    @staticmethod
+    def _has_only_committed_turns(messages: list) -> bool:
+        if len(messages) == 1:
+            return isinstance(messages[0], SystemMessage)
+
+        index = 1
+        while index < len(messages):
+            if not isinstance(messages[index], HumanMessage):
+                return False
+            index += 1
+
+            final_answer_seen = False
+            while index < len(messages):
+                ai_message = messages[index]
+                if not isinstance(ai_message, AIMessage):
+                    return False
+                index += 1
+
+                if not ai_message.tool_calls:
+                    final_answer_seen = True
+                    break
+
+                pending_tool_call_ids = {
+                    tool_call["id"]
+                    for tool_call in ai_message.tool_calls
+                }
+                while (
+                    index < len(messages)
+                    and isinstance(messages[index], ToolMessage)
+                ):
+                    tool_call_id = messages[index].tool_call_id
+                    if tool_call_id not in pending_tool_call_ids:
+                        return False
+                    pending_tool_call_ids.remove(tool_call_id)
+                    index += 1
+                if pending_tool_call_ids:
+                    return False
+
+            if not final_answer_seen:
+                return False
+
+        return True
+
     def _stream_response(
         self,
         active_model,
@@ -674,19 +808,26 @@ class WorkspaceAgent:
         if tool_name in self.approval_required_tools:
             preview = ""
             previewer = self.approval_previewers.get(tool_name)
-            if previewer is not None:
+            preparer = self.approval_preparers.get(tool_name)
+            if previewer is not None or preparer is not None:
                 try:
-                    prepared_preview = self._invoke_approval_previewer(
-                        previewer,
-                        internal_args,
-                    )
-                    if isinstance(prepared_preview, PreparedToolAction):
-                        prepared_action = prepared_preview
+                    if preparer is not None:
+                        prepared_action = self._invoke_approval_preparer(
+                            preparer,
+                            internal_args,
+                        )
                         preview = prepared_action.preview
                     else:
-                        preview = str(prepared_preview)
+                        preview = self._invoke_approval_previewer(
+                            previewer,
+                            internal_args,
+                        )
                 except Exception as error:
-                    preview_error = f"工具预览失败：{error}"
+                    if preparer is not None:
+                        error_detail = "审批准备失败"
+                    else:
+                        error_detail = "变更预览失败"
+                    preview_error = f"{error_detail}：{error}"
                     character_count, truncated = self._append_tool_message(
                         messages=working_messages,
                         content=preview_error,
@@ -698,7 +839,7 @@ class WorkspaceAgent:
                         name=tool_name,
                         status="error",
                         character_count=character_count,
-                        detail="变更预览失败",
+                        detail=error_detail,
                         truncated=truncated,
                     )
                     return
@@ -828,15 +969,49 @@ class WorkspaceAgent:
 
     @staticmethod
     def _invoke_approval_previewer(
-        previewer: Callable,
+        previewer: Callable[..., str],
         tool_args: dict,
-    ) -> str | PreparedToolAction:
-        preview_args = deepcopy(tool_args)
-        if hasattr(previewer, "invoke"):
-            preview = previewer.invoke(preview_args)
-        else:
-            preview = previewer(**preview_args)
+    ) -> str:
+        preview = WorkspaceAgent._invoke_approval_handler(
+            previewer,
+            tool_args,
+        )
+        if not isinstance(preview, str):
+            raise TypeError("approval_previewer 必须返回 str")
         return preview
+
+    @staticmethod
+    def _invoke_approval_preparer(
+        preparer: Callable[..., PreparedToolAction],
+        tool_args: dict,
+    ) -> PreparedToolAction:
+        prepared_action = WorkspaceAgent._invoke_approval_handler(
+            preparer,
+            tool_args,
+        )
+        if not isinstance(prepared_action, PreparedToolAction):
+            raise TypeError(
+                "approval_preparer 必须返回 PreparedToolAction"
+            )
+        if not isinstance(prepared_action.preview, str):
+            raise TypeError(
+                "PreparedToolAction.preview 必须是 str"
+            )
+        if not callable(prepared_action.execute):
+            raise TypeError(
+                "PreparedToolAction.execute 必须可调用"
+            )
+        return prepared_action
+
+    @staticmethod
+    def _invoke_approval_handler(
+        handler: Callable,
+        tool_args: dict,
+    ):
+        handler_args = deepcopy(tool_args)
+        if hasattr(handler, "invoke"):
+            return handler.invoke(handler_args)
+        return handler(**handler_args)
 
     def _append_tool_message(
         self,
