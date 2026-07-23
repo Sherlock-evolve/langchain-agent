@@ -588,6 +588,183 @@ def test_approved_write_preserves_existing_file_mode(
     assert stat.S_IMODE(script_file.stat().st_mode) == 0o755
 
 
+def test_existing_file_change_during_approval_causes_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    target_file = tmp_path / "conflict.txt"
+    target_file.write_text("审批时内容\n", encoding="utf-8")
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-existing-conflict",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {
+                            "path": "conflict.txt",
+                            "content": "Agent 新内容\n",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="检测到写入冲突。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.prepare_write_file
+        },
+    )
+
+    stream = agent.stream_turn("更新可能冲突的文件")
+    next(stream)
+    approval_event = next(stream)
+    target_file.write_text("外部程序的新内容\n", encoding="utf-8")
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "error"
+    assert result_event.detail == "写入冲突"
+    assert target_file.read_text(encoding="utf-8") == "外部程序的新内容\n"
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "工具执行冲突" in tool_message.content
+    assert "外部修改已保留" in tool_message.content
+
+
+def test_new_file_created_during_approval_causes_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    target_file = tmp_path / "new-conflict.txt"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-new-conflict",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {
+                            "path": "new-conflict.txt",
+                            "content": "Agent 创建内容\n",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="新文件写入发生冲突。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.prepare_write_file
+        },
+    )
+
+    stream = agent.stream_turn("创建可能冲突的文件")
+    next(stream)
+    approval_event = next(stream)
+    target_file.write_text("外部程序抢先创建\n", encoding="utf-8")
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "error"
+    assert result_event.detail == "写入冲突"
+    assert target_file.read_text(encoding="utf-8") == "外部程序抢先创建\n"
+    tool_message = next(
+        message
+        for message in agent.messages
+        if isinstance(message, ToolMessage)
+    )
+    assert "审批时文件不存在，但执行前已被创建" in tool_message.content
+
+
+def test_prepared_write_succeeds_when_snapshot_is_unchanged(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        workspace_tools,
+        "WORKSPACE_ROOT",
+        tmp_path.resolve(),
+    )
+    script_file = tmp_path / "stable.sh"
+    script_file.write_text("#!/bin/sh\necho stable\n", encoding="utf-8")
+    script_file.chmod(0o755)
+    new_content = "#!/bin/sh\necho updated\n"
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                (
+                    "write-stable",
+                    workspace_tools.write_file.name,
+                    json.dumps(
+                        {"path": "stable.sh", "content": new_content}
+                    ),
+                ),
+            ),
+            [AIMessageChunk(content="无冲突写入完成。")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[workspace_tools.write_file],
+        approval_required_tools={workspace_tools.write_file.name},
+        approval_previewers={
+            workspace_tools.write_file.name:
+            workspace_tools.prepare_write_file
+        },
+    )
+
+    stream = agent.stream_turn("更新未变化的脚本")
+    next(stream)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    list(stream)
+
+    assert result_event.status == "success"
+    assert script_file.read_text(encoding="utf-8") == new_content
+    assert stat.S_IMODE(script_file.stat().st_mode) == 0o755
+
+
 def test_rejected_write_leaves_file_unchanged(
     tmp_path,
     monkeypatch,

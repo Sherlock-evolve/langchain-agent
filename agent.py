@@ -68,6 +68,16 @@ class ApprovalDecision:
 
 
 @dataclass(frozen=True)
+class PreparedToolAction:
+    preview: str
+    execute: Callable[[], str]
+
+
+class ToolActionConflictError(RuntimeError):
+    """工具预览后的目标状态发生变化。"""
+
+
+@dataclass(frozen=True)
 class SystemEvent:
     message: str
 
@@ -660,15 +670,21 @@ class WorkspaceAgent:
             )
             return
 
+        prepared_action = None
         if tool_name in self.approval_required_tools:
             preview = ""
             previewer = self.approval_previewers.get(tool_name)
             if previewer is not None:
                 try:
-                    preview = self._invoke_approval_previewer(
+                    prepared_preview = self._invoke_approval_previewer(
                         previewer,
                         internal_args,
                     )
+                    if isinstance(prepared_preview, PreparedToolAction):
+                        prepared_action = prepared_preview
+                        preview = prepared_action.preview
+                    else:
+                        preview = str(prepared_preview)
                 except Exception as error:
                     preview_error = f"工具预览失败：{error}"
                     character_count, truncated = self._append_tool_message(
@@ -727,9 +743,30 @@ class WorkspaceAgent:
             state.tool_budget_exhausted = True
 
         try:
-            selected_tool = self.tools_by_name[tool_name]
-            tool_result_text = str(selected_tool.invoke(internal_args))
+            if prepared_action is not None:
+                tool_result_text = str(prepared_action.execute())
+            else:
+                selected_tool = self.tools_by_name[tool_name]
+                tool_result_text = str(selected_tool.invoke(internal_args))
             tool_status = "success"
+        except ToolActionConflictError as error:
+            self._append_control_tool_message(
+                messages=working_messages,
+                content=(
+                    f"工具执行冲突：{error}\n"
+                    "本次写入未执行，外部修改已保留。"
+                    "请根据最新状态重新读取或重新发起写入。"
+                ),
+                tool_call_id=tool_call_id,
+            )
+            yield ToolResultEvent(
+                tool_call_id=tool_call_id,
+                name=tool_name,
+                status="error",
+                character_count=0,
+                detail="写入冲突",
+            )
+            return
         except Exception as error:
             tool_result_text = f"工具执行失败：{error}"
             tool_status = "error"
@@ -793,13 +830,13 @@ class WorkspaceAgent:
     def _invoke_approval_previewer(
         previewer: Callable,
         tool_args: dict,
-    ) -> str:
+    ) -> str | PreparedToolAction:
         preview_args = deepcopy(tool_args)
         if hasattr(previewer, "invoke"):
             preview = previewer.invoke(preview_args)
         else:
             preview = previewer(**preview_args)
-        return str(preview)
+        return preview
 
     def _append_tool_message(
         self,

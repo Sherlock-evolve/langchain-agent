@@ -18,7 +18,7 @@ from agent import (
 )
 from tools import (
     list_files,
-    preview_write_file,
+    prepare_write_file,
     read_file,
     search_text,
     write_file,
@@ -109,7 +109,7 @@ def main() -> None:
         model=model,
         tools=[list_files, read_file, search_text, write_file],
         approval_required_tools={write_file.name},
-        approval_previewers={write_file.name: preview_write_file},
+        approval_previewers={write_file.name: prepare_write_file},
     )
 
     while True:

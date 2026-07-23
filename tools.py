@@ -1,10 +1,14 @@
 import difflib
+import hashlib
 import os
 import stat
 import tempfile
+from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 
 from langchain_core.tools import tool
+
+from agent import PreparedToolAction, ToolActionConflictError
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
@@ -97,6 +101,85 @@ def _resolve_write_target(path: str) -> Path:
     if not file_path.parent.is_dir():
         raise NotADirectoryError(f"父路径不是目录：{file_path.parent}")
     return file_path
+
+
+def _file_sha256(file_path: Path) -> str:
+    digest = hashlib.sha256()
+    with file_path.open("rb") as file:
+        for chunk in iter(lambda: file.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_file(
+    file_path: Path,
+    display_path: str,
+    content: str,
+    encoded_content: bytes,
+    before_replace: Callable[[], None] | None = None,
+) -> str:
+    file_exists = file_path.exists()
+    status = "更新" if file_exists else "创建"
+    existing_mode = (
+        stat.S_IMODE(file_path.stat().st_mode)
+        if file_exists
+        else None
+    )
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=file_path.parent,
+            prefix=f".{file_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(encoded_content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+        if before_replace is not None:
+            before_replace()
+        os.replace(temporary_path, file_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+    return f"已{status} {display_path}，共 {len(content)} 个字符"
+
+
+def _build_write_preview(
+    file_path: Path,
+    old_content: str,
+    new_content: str,
+) -> str:
+    display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
+    preview = "".join(
+        difflib.unified_diff(
+            old_content.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{display_path}",
+            tofile=f"b/{display_path}",
+        )
+    )
+    if not preview:
+        return "（文件内容无变化）"
+
+    if len(preview) > MAX_WRITE_PREVIEW_CHARACTERS:
+        body_limit = (
+            MAX_WRITE_PREVIEW_CHARACTERS
+            - len(WRITE_PREVIEW_TRUNCATION_MARKER)
+        )
+        preview = preview[:body_limit] + WRITE_PREVIEW_TRUNCATION_MARKER
+    return preview
 
 
 @tool
@@ -220,77 +303,89 @@ def write_file(path: str, content: str) -> str:
     """原子创建或更新项目内文本文件；写入前必须由 Agent 获得用户审批。"""
     file_path = _resolve_write_target(path)
     encoded_content = _validate_write_content(content)
-    file_exists = file_path.exists()
-    status = "更新" if file_exists else "创建"
-    existing_mode = (
-        stat.S_IMODE(file_path.stat().st_mode)
-        if file_exists
-        else None
+    return _atomic_write_file(
+        file_path=file_path,
+        display_path=path,
+        content=content,
+        encoded_content=encoded_content,
     )
-    temporary_path = None
 
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=file_path.parent,
-            prefix=f".{file_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(encoded_content)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
 
-        if existing_mode is not None:
-            os.chmod(temporary_path, existing_mode)
-        os.replace(temporary_path, file_path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
+def prepare_write_file(path: str, content: str) -> PreparedToolAction:
+    """准备带文件快照校验的写入操作，但不修改文件。"""
+    file_path = _resolve_write_target(path)
+    encoded_content = _validate_write_content(content)
+    file_existed = file_path.exists()
+
+    if file_existed:
+        if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+            raise ValueError("原文件超过 1 MB，拒绝生成写入预览")
+        old_bytes = file_path.read_bytes()
+        if len(old_bytes) > MAX_FILE_SIZE_BYTES:
+            raise ValueError("原文件超过 1 MB，拒绝生成写入预览")
+        old_content = old_bytes.decode("utf-8")
+        expected_sha256 = hashlib.sha256(old_bytes).hexdigest()
+    else:
+        old_content = ""
+        expected_sha256 = None
+
+    preview = _build_write_preview(
+        file_path=file_path,
+        old_content=old_content,
+        new_content=content,
+    )
+
+    def validate_snapshot() -> None:
+        try:
+            current_path = _resolve_write_target(path)
+        except Exception as error:
+            raise ToolActionConflictError(
+                f"写入目标状态已变化：{error}。"
+            ) from error
+
+        if current_path != file_path:
+            raise ToolActionConflictError("写入目标解析位置已变化。")
+
+        current_exists = current_path.exists()
+        if current_exists != file_existed:
+            if file_existed:
+                detail = "审批时文件存在，但执行前已不存在。"
+            else:
+                detail = "审批时文件不存在，但执行前已被创建。"
+            raise ToolActionConflictError(detail)
+
+        if file_existed:
             try:
-                temporary_path.unlink()
-            except OSError:
-                pass
+                current_sha256 = _file_sha256(current_path)
+            except OSError as error:
+                raise ToolActionConflictError(
+                    f"无法确认当前文件状态：{error}。"
+                ) from error
+            if current_sha256 != expected_sha256:
+                raise ToolActionConflictError(
+                    "文件内容在审批后发生变化。"
+                )
 
-    return f"已{status} {path}，共 {len(content)} 个字符"
+    def execute() -> str:
+        validate_snapshot()
+        return _atomic_write_file(
+            file_path=file_path,
+            display_path=path,
+            content=content,
+            encoded_content=encoded_content,
+            before_replace=validate_snapshot,
+        )
+
+    return PreparedToolAction(
+        preview=preview,
+        execute=execute,
+    )
 
 
 @tool
 def preview_write_file(path: str, content: str) -> str:
     """预览 write_file 将产生的统一 diff；不会修改文件。"""
-    file_path = _resolve_write_target(path)
-    _validate_write_content(content)
-
-    if file_path.exists():
-        if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
-            raise ValueError("原文件超过 1 MB，拒绝生成写入预览")
-        old_content = file_path.read_text(encoding="utf-8")
-    else:
-        old_content = ""
-
-    display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
-    preview = "".join(
-        difflib.unified_diff(
-            old_content.splitlines(keepends=True),
-            content.splitlines(keepends=True),
-            fromfile=f"a/{display_path}",
-            tofile=f"b/{display_path}",
-        )
-    )
-    if not preview:
-        return "（文件内容无变化）"
-
-    if len(preview) > MAX_WRITE_PREVIEW_CHARACTERS:
-        body_limit = (
-            MAX_WRITE_PREVIEW_CHARACTERS
-            - len(WRITE_PREVIEW_TRUNCATION_MARKER)
-        )
-        preview = (
-            preview[:body_limit]
-            + WRITE_PREVIEW_TRUNCATION_MARKER
-        )
-    return preview
+    return prepare_write_file(path=path, content=content).preview
 
 
 @tool
