@@ -22,6 +22,7 @@ from contracts import (
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
     PreparedToolAction,
+    SessionSavedEvent,
     SystemEvent,
     TokenEvent,
     ToolActionConflictError,

@@ -66,6 +66,11 @@ class MemoryUpdatedEvent:
     character_count: int
 
 
+@dataclass(frozen=True)
+class SessionSavedEvent:
+    session_id: str
+
+
 AgentEvent = (
     TokenEvent
     | ToolCallEvent
@@ -74,4 +79,5 @@ AgentEvent = (
     | SystemEvent
     | ContextTrimmedEvent
     | MemoryUpdatedEvent
+    | SessionSavedEvent
 )

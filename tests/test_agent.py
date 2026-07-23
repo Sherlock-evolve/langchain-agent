@@ -13,6 +13,7 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import tool
 
+import session_store
 import tools as workspace_tools
 from agent import (
     ApprovalDecision,
@@ -24,6 +25,12 @@ from agent import (
     ToolCallEvent,
     ToolResultEvent,
     WorkspaceAgent,
+)
+from contracts import SessionSavedEvent
+from persistent_session import (
+    PersistentSession,
+    PersistentSessionOpenError,
+    PersistentSessionSaveError,
 )
 
 
@@ -1807,3 +1814,256 @@ def test_snapshot_data_does_not_share_mutable_objects_with_agent():
     assert restore_input["messages"][0]["data"]["content"] == (
         pristine_export["messages"][0]["data"]["content"]
     )
+
+
+def test_persistent_session_creates_and_saves_new_session(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    model = ScriptedModel(
+        [[AIMessageChunk(content="首次持久化回答。")]]
+    )
+    session = PersistentSession.open(
+        "new-session",
+        lambda: WorkspaceAgent(model=model, tools=[]),
+    )
+
+    events = list(session.stream_turn("创建新会话"))
+
+    assert events == [
+        TokenEvent(text="首次持久化回答。"),
+        SessionSavedEvent(session_id="new-session"),
+    ]
+    assert session.dirty is False
+    assert session_store.load("new-session") == (
+        session.agent.export_snapshot()
+    )
+
+
+def test_persistent_session_open_restores_existing_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    store_root = tmp_path / ".agent_sessions"
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        store_root,
+    )
+    source_agent = agent_with_committed_tool_history()
+    snapshot = source_agent.export_snapshot()
+    session_store.save("existing", snapshot)
+    original_file = (store_root / "existing.json").read_bytes()
+
+    session = PersistentSession.open(
+        "existing",
+        lambda: WorkspaceAgent(
+            model=ScriptedModel([]),
+            tools=[read_test_note],
+        ),
+    )
+
+    assert session.agent.export_snapshot() == snapshot
+    assert session.dirty is False
+    assert (store_root / "existing.json").read_bytes() == original_file
+
+
+def test_persistent_session_forwards_approval_decisions(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("persistent-approval", "echo_test", '{"value":"once"}'),
+            ),
+            [AIMessageChunk(content="审批后的持久化回答。")],
+        ]
+    )
+    session = PersistentSession.open(
+        "approval-session",
+        lambda: WorkspaceAgent(
+            model=model,
+            tools=[echo_test],
+            approval_required_tools={"echo_test"},
+        ),
+    )
+
+    stream = session.stream_turn("执行需要审批的工具")
+    call_event = next(stream)
+    approval_event = next(stream)
+    result_event = stream.send(
+        ApprovalDecision(
+            tool_call_id=approval_event.tool_call_id,
+            approved=True,
+        )
+    )
+    remaining_events = list(stream)
+
+    assert isinstance(call_event, ToolCallEvent)
+    assert isinstance(approval_event, ApprovalRequiredEvent)
+    assert result_event.status == "success"
+    assert ECHO_EXECUTIONS == ["once"]
+    assert remaining_events == [
+        TokenEvent(text="审批后的持久化回答。"),
+        SessionSavedEvent(session_id="approval-session"),
+    ]
+    assert session_store.load("approval-session") == (
+        session.agent.export_snapshot()
+    )
+
+
+def test_cancelled_or_incomplete_turn_is_not_saved(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    cancelled_model = ScriptedModel(
+        [[AIMessageChunk(content="尚未提交")]]
+    )
+    cancelled_session = PersistentSession.open(
+        "cancelled",
+        lambda: WorkspaceAgent(model=cancelled_model, tools=[]),
+    )
+
+    stream = cancelled_session.stream_turn("取消本轮")
+    assert next(stream) == TokenEvent(text="尚未提交")
+    stream.close()
+
+    assert cancelled_session.dirty is False
+    assert session_store.list_sessions() == []
+
+    incomplete_model = ScriptedModel([[]])
+    incomplete_session = PersistentSession.open(
+        "incomplete",
+        lambda: WorkspaceAgent(model=incomplete_model, tools=[]),
+    )
+    events = list(incomplete_session.stream_turn("模型无响应"))
+
+    assert len(events) == 1
+    assert isinstance(events[0], SystemEvent)
+    assert not any(
+        isinstance(event, SessionSavedEvent) for event in events
+    )
+    assert incomplete_session.dirty is False
+    assert session_store.list_sessions() == []
+
+
+def test_save_failure_marks_dirty_and_flush_does_not_replay_tools(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        tmp_path / ".agent_sessions",
+    )
+    ECHO_EXECUTIONS.clear()
+    model = ScriptedModel(
+        [
+            parallel_tool_call_response(
+                ("dirty-tool-call", "echo_test", '{"value":"side-effect"}'),
+            ),
+            [AIMessageChunk(content="工具调用后的回答。")],
+        ]
+    )
+    session = PersistentSession.open(
+        "dirty-session",
+        lambda: WorkspaceAgent(model=model, tools=[echo_test]),
+    )
+    real_save = session_store.save
+    save_attempts = []
+
+    def flaky_save(session_id, snapshot):
+        save_attempts.append(session_id)
+        if len(save_attempts) == 1:
+            raise session_store.SessionStoreError("模拟保存失败")
+        real_save(session_id, snapshot)
+
+    monkeypatch.setattr(session_store, "save", flaky_save)
+    events = []
+    stream = session.stream_turn("产生一次工具副作用")
+
+    with pytest.raises(PersistentSessionSaveError):
+        while True:
+            events.append(next(stream))
+
+    assert session.dirty is True
+    assert ECHO_EXECUTIONS == ["side-effect"]
+    assert model.call_log == [True, True]
+    assert not any(
+        isinstance(event, SessionSavedEvent) for event in events
+    )
+
+    with pytest.raises(PersistentSessionSaveError, match="flush"):
+        list(session.stream_turn("不得开始下一轮"))
+
+    session.flush()
+
+    assert session.dirty is False
+    assert ECHO_EXECUTIONS == ["side-effect"]
+    assert model.call_log == [True, True]
+    assert save_attempts == ["dirty-session", "dirty-session"]
+    assert session_store.load("dirty-session") == (
+        session.agent.export_snapshot()
+    )
+
+    session.flush()
+    assert save_attempts == ["dirty-session", "dirty-session"]
+
+
+def test_open_rejects_corrupt_or_semantically_invalid_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    store_root = tmp_path / ".agent_sessions"
+    monkeypatch.setattr(
+        session_store,
+        "SESSION_STORE_ROOT",
+        store_root,
+    )
+    store_root.mkdir(mode=0o700)
+    corrupt_file = store_root / "corrupt.json"
+    corrupt_file.write_text("{invalid-json", encoding="utf-8")
+    corrupt_bytes = corrupt_file.read_bytes()
+    factory_calls = []
+
+    def agent_factory():
+        factory_calls.append("called")
+        return WorkspaceAgent(model=ScriptedModel([]), tools=[])
+
+    with pytest.raises(PersistentSessionOpenError, match="无法加载"):
+        PersistentSession.open("corrupt", agent_factory)
+
+    assert factory_calls == []
+    assert corrupt_file.read_bytes() == corrupt_bytes
+
+    invalid_snapshot = {
+        "version": 2,
+        "messages": [],
+        "memory_summary": "",
+    }
+    session_store.save("semantic", invalid_snapshot)
+    semantic_file = store_root / "semantic.json"
+    semantic_bytes = semantic_file.read_bytes()
+
+    with pytest.raises(PersistentSessionOpenError, match="语义无效"):
+        PersistentSession.open("semantic", agent_factory)
+
+    assert factory_calls == ["called"]
+    assert semantic_file.read_bytes() == semantic_bytes
