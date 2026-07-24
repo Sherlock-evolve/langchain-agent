@@ -11,6 +11,7 @@ from typing import Annotated
 
 from langchain_core.tools import StructuredTool
 
+from citations import format_citation
 from knowledge_retriever import (
     MAX_QUERY_CHARACTERS,
     MAX_SEARCH_RESULTS,
@@ -107,39 +108,22 @@ def _contains_unsafe_source_character(source: str) -> bool:
     )
 
 
-def _validate_citation_fields(result: RetrievedChunk) -> None:
-    if (
-        not isinstance(result.source, str)
-        or not result.source
-        or _contains_unsafe_source_character(result.source)
-    ):
-        raise KnowledgeToolError(
-            "Knowledge retrieval returned unsafe citation metadata."
+def _validated_citation(result: RetrievedChunk) -> str:
+    try:
+        citation = format_citation(
+            result.source,
+            result.start_line,
+            result.end_line,
         )
-    if (
-        isinstance(result.start_line, bool)
-        or not isinstance(result.start_line, int)
-        or result.start_line < 1
-        or isinstance(result.end_line, bool)
-        or not isinstance(result.end_line, int)
-        or result.end_line < result.start_line
-    ):
+    except (TypeError, ValueError):
         raise KnowledgeToolError(
             "Knowledge retrieval returned invalid citation metadata."
-        )
+        ) from None
     if not isinstance(result.chunk_id, str) or not result.chunk_id:
         raise KnowledgeToolError(
             "Knowledge retrieval returned invalid chunk metadata."
         )
-
-
-def _citation_for(result: RetrievedChunk) -> str:
-    if result.start_line == result.end_line:
-        return f"{result.source}:L{result.start_line}"
-    return (
-        f"{result.source}:L{result.start_line}"
-        f"-L{result.end_line}"
-    )
+    return citation
 
 
 def _limited_content(content: str) -> tuple[str, bool]:
@@ -186,7 +170,7 @@ def _format_result(result: RetrievedChunk) -> tuple[dict, bool]:
         raise KnowledgeToolError(
             "Knowledge retrieval returned an invalid rank."
         )
-    _validate_citation_fields(result)
+    citation = _validated_citation(result)
     content, content_truncated = _limited_content(result.content)
     return (
         {
@@ -197,7 +181,7 @@ def _format_result(result: RetrievedChunk) -> tuple[dict, bool]:
             "start_line": result.start_line,
             "end_line": result.end_line,
             "chunk_id": result.chunk_id,
-            "citation": _citation_for(result),
+            "citation": citation,
         },
         content_truncated,
     )
