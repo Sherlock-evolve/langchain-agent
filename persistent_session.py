@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import session_store
 from agent import WorkspaceAgent
+from async_runtime import bridge_sync_generator
 from contracts import (
     AgentEvent,
     ApprovalDecision,
@@ -37,12 +38,31 @@ class PersistentSession:
         session_id: str,
         agent: WorkspaceAgent,
         turn_id_factory: Callable[[], str] | None = None,
+        store_backend=None,
     ):
         if turn_id_factory is not None and not callable(turn_id_factory):
             raise TypeError("turn_id_factory 必须可调用")
 
         self.session_id = session_id
         self.agent = agent
+        self.store_backend = (
+            store_backend
+            if store_backend is not None
+            else session_store
+        )
+        for method_name in (
+            "save",
+            "save_pending",
+            "load",
+            "load_pending",
+            "delete_pending",
+        ):
+            if not callable(
+                getattr(self.store_backend, method_name, None)
+            ):
+                raise TypeError(
+                    f"store_backend 缺少 {method_name}()"
+                )
         self.turn_id_factory = (
             turn_id_factory
             if turn_id_factory is not None
@@ -58,9 +78,15 @@ class PersistentSession:
         session_id: str,
         agent_factory: Callable[[], WorkspaceAgent],
         turn_id_factory: Callable[[], str] | None = None,
+        store_backend=None,
     ) -> "PersistentSession":
+        backend = (
+            store_backend
+            if store_backend is not None
+            else session_store
+        )
         try:
-            snapshot = session_store.load(session_id)
+            snapshot = backend.load(session_id)
         except session_store.SessionNotFoundError:
             snapshot = None
         except session_store.SessionStoreError as error:
@@ -68,7 +94,7 @@ class PersistentSession:
                 f"无法加载会话 {session_id}：{error}"
             ) from error
         try:
-            pending_approval = session_store.load_pending(session_id)
+            pending_approval = backend.load_pending(session_id)
         except session_store.SessionStoreError as error:
             raise PersistentSessionOpenError(
                 f"无法加载会话 {session_id} 的待审批轮次：{error}"
@@ -97,6 +123,7 @@ class PersistentSession:
             session_id=session_id,
             agent=agent,
             turn_id_factory=turn_id_factory,
+            store_backend=backend,
         )
 
     @property
@@ -113,6 +140,8 @@ class PersistentSession:
     def stream_turn(
         self,
         question: str,
+        *,
+        request_idempotency_key: str | None = None,
     ) -> Generator[EventEnvelope, ApprovalDecision | None, None]:
         if not self._operation_lock.acquire(blocking=False):
             raise RuntimeError("持久化会话已有正在进行的操作")
@@ -127,10 +156,49 @@ class PersistentSession:
                     "会话存在待恢复审批，请先恢复或拒绝该审批"
                 )
             turn_id = self._create_turn_id()
-            events = self._stream_and_persist(question)
+            events = self._stream_and_persist(
+                question,
+                request_idempotency_key=request_idempotency_key,
+            )
             yield from self._envelope_events(events, turn_id)
         finally:
             self._operation_lock.release()
+
+    async def astream_turn(
+        self,
+        question: str,
+        *,
+        cancellation_reason: str = "client_disconnect",
+        request_idempotency_key: str | None = None,
+    ):
+        """Asynchronously stream a persisted turn with approval ``asend``."""
+
+        def stream_factory():
+            self.agent._prefer_async_execution = True
+            try:
+                yield from self.stream_turn(
+                    question,
+                    request_idempotency_key=request_idempotency_key,
+                )
+            finally:
+                self.agent._prefer_async_execution = False
+
+        stream = bridge_sync_generator(
+            stream_factory,
+            cancel_callback=lambda: self.cancel_active_turn(
+                cancellation_reason
+            ),
+        )
+        decision = None
+        try:
+            while True:
+                try:
+                    envelope = await stream.asend(decision)
+                except StopAsyncIteration:
+                    return
+                decision = yield envelope
+        finally:
+            await stream.aclose()
 
     def stream_resume_pending_approval(
         self,
@@ -150,6 +218,37 @@ class PersistentSession:
             yield from self._envelope_events(events, turn_id)
         finally:
             self._operation_lock.release()
+
+    async def astream_resume_pending_approval(
+        self,
+        *,
+        cancellation_reason: str = "client_disconnect",
+    ):
+        """Asynchronously resume a safely persisted approval transaction."""
+
+        def stream_factory():
+            self.agent._prefer_async_execution = True
+            try:
+                yield from self.stream_resume_pending_approval()
+            finally:
+                self.agent._prefer_async_execution = False
+
+        stream = bridge_sync_generator(
+            stream_factory,
+            cancel_callback=lambda: self.cancel_active_turn(
+                cancellation_reason
+            ),
+        )
+        decision = None
+        try:
+            while True:
+                try:
+                    envelope = await stream.asend(decision)
+                except StopAsyncIteration:
+                    return
+                decision = yield envelope
+        finally:
+            await stream.aclose()
 
     def cancel_active_turn(self, reason: str = "user") -> bool:
         return self.agent.cancel_active_turn(reason)
@@ -201,8 +300,13 @@ class PersistentSession:
     def _stream_and_persist(
         self,
         question: str,
+        *,
+        request_idempotency_key: str | None = None,
     ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
-        agent_stream = self.agent.stream_turn(question)
+        agent_stream = self.agent.stream_turn(
+            question,
+            request_idempotency_key=request_idempotency_key,
+        )
         yield from self._persist_agent_stream(agent_stream)
 
     def _resume_and_persist(
@@ -235,7 +339,7 @@ class PersistentSession:
                     pending_record = self.agent.export_pending_approval()
                     if pending_record is not None:
                         try:
-                            session_store.save_pending(
+                            self.store_backend.save_pending(
                                 self.session_id,
                                 pending_record,
                             )
@@ -245,7 +349,7 @@ class PersistentSession:
                             ) from error
                 elif isinstance(event, ApprovalResolvedEvent):
                     try:
-                        session_store.delete_pending(
+                        self.store_backend.delete_pending(
                             self.session_id,
                             missing_ok=True,
                         )
@@ -267,7 +371,7 @@ class PersistentSession:
             return
 
         try:
-            session_store.save(self.session_id, after_snapshot)
+            self.store_backend.save(self.session_id, after_snapshot)
         except Exception as error:
             self._mark_dirty(after_snapshot)
             raise PersistentSessionSaveError(
@@ -285,7 +389,7 @@ class PersistentSession:
                 return
             pending_snapshot = deepcopy(self._pending_snapshot)
             try:
-                session_store.save(
+                self.store_backend.save(
                     self.session_id,
                     pending_snapshot,
                 )

@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable, Generator
 from copy import deepcopy
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, local
 from typing import Literal
 
 from langchain_core.messages import (
@@ -18,6 +18,11 @@ from langchain_core.messages import (
     trim_messages,
 )
 
+from async_runtime import (
+    bridge_sync_generator,
+    iterate_async_synchronously,
+    run_coroutine_synchronously,
+)
 from contracts import (
     AgentEvent,
     ApprovalDecision,
@@ -39,6 +44,7 @@ from contracts import (
 )
 from tool_execution import (
     CancellationToken,
+    IDEMPOTENCY_KEY_PATTERN,
     ToolExecutionCancelled,
     ToolExecutionMiddleware,
     ToolExecutionPolicy,
@@ -97,6 +103,7 @@ class _TurnState:
     tool_budget_exhausted: bool = False
     tool_result_character_count: int = 0
     tool_result_budget_exhausted: bool = False
+    request_idempotency_key: str | None = None
 
 
 class WorkspaceAgent:
@@ -230,12 +237,31 @@ class WorkspaceAgent:
                 "tool_execution_middleware 必须是 ToolExecutionMiddleware"
             )
         self.tool_execution_middleware = tool_execution_middleware
+        self.tool_execution_middleware.validate_registered_tools(
+            self.tools_by_name
+        )
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
         self.memory_summary = ""
         self._turn_lock = Lock()
         self._active_cancellation_token = None
         self._pending_approval = None
+        self._execution_context = local()
+        self._prefer_async_execution = False
+
+    @property
+    def _prefer_async_execution(self) -> bool:
+        return bool(
+            getattr(
+                self._execution_context,
+                "prefer_async_execution",
+                False,
+            )
+        )
+
+    @_prefer_async_execution.setter
+    def _prefer_async_execution(self, value: bool) -> None:
+        self._execution_context.prefer_async_execution = bool(value)
 
     def export_snapshot(self) -> dict:
         """导出当前已提交会话状态的 JSON 可序列化副本。"""
@@ -376,8 +402,21 @@ class WorkspaceAgent:
     def stream_turn(
         self,
         question: str,
+        *,
+        request_idempotency_key: str | None = None,
     ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         """运行一轮并产生事件；提前停止消费时应关闭返回的生成器。"""
+        if (
+            request_idempotency_key is not None
+            and (
+                not isinstance(request_idempotency_key, str)
+                or IDEMPOTENCY_KEY_PATTERN.fullmatch(
+                    request_idempotency_key
+                )
+                is None
+            )
+        ):
+            raise ValueError("request_idempotency_key 非法")
         if not self._turn_lock.acquire(blocking=False):
             raise RuntimeError("同一 WorkspaceAgent 不能同时运行多个对话轮次")
         if self._pending_approval is not None:
@@ -388,7 +427,10 @@ class WorkspaceAgent:
         self._active_cancellation_token = cancellation_token
         try:
             try:
-                yield from self._run_turn_transaction(question)
+                yield from self._run_turn_transaction(
+                    question,
+                    request_idempotency_key=request_idempotency_key,
+                )
             except ToolExecutionCancelled:
                 yield TurnCancelledEvent(
                     reason=cancellation_token.reason,
@@ -396,6 +438,47 @@ class WorkspaceAgent:
         finally:
             self._active_cancellation_token = None
             self._turn_lock.release()
+
+    async def astream_turn(
+        self,
+        question: str,
+        *,
+        cancellation_reason: str = "client_disconnect",
+        request_idempotency_key: str | None = None,
+    ):
+        """Asynchronously stream one transactional turn.
+
+        The worker prefers model ``astream`` and tool ``ainvoke`` interfaces
+        while preserving the synchronous generator's approval ``asend``
+        protocol and rollback behavior.
+        """
+
+        def stream_factory():
+            self._prefer_async_execution = True
+            try:
+                yield from self.stream_turn(
+                    question,
+                    request_idempotency_key=request_idempotency_key,
+                )
+            finally:
+                self._prefer_async_execution = False
+
+        stream = bridge_sync_generator(
+            stream_factory,
+            cancel_callback=lambda: self.cancel_active_turn(
+                cancellation_reason
+            ),
+        )
+        decision = None
+        try:
+            while True:
+                try:
+                    event = await stream.asend(decision)
+                except StopAsyncIteration:
+                    return
+                decision = yield event
+        finally:
+            await stream.aclose()
 
     def cancel_active_turn(self, reason: str = "user") -> bool:
         """请求取消当前轮次；没有活跃轮次时返回 False。"""
@@ -407,6 +490,8 @@ class WorkspaceAgent:
     def _run_turn_transaction(
         self,
         question: str,
+        *,
+        request_idempotency_key: str | None = None,
     ) -> Generator[AgentEvent, ApprovalDecision | None, None]:
         current_message = HumanMessage(content=question)
         base_system_message = SystemMessage(content=SYSTEM_PROMPT)
@@ -472,7 +557,9 @@ class WorkspaceAgent:
         )
         current_turn_start_index = len(working_messages) - 1
 
-        state = _TurnState()
+        state = _TurnState(
+            request_idempotency_key=request_idempotency_key,
+        )
         yield from self._continue_turn_transaction(
             working_messages=working_messages,
             working_summary=working_summary,
@@ -689,6 +776,7 @@ class WorkspaceAgent:
             tool_result_budget_exhausted=(
                 state.tool_result_budget_exhausted
             ),
+            request_idempotency_key=state.request_idempotency_key,
         )
 
     @staticmethod
@@ -707,6 +795,7 @@ class WorkspaceAgent:
             "tool_result_budget_exhausted": (
                 state.tool_result_budget_exhausted
             ),
+            "request_idempotency_key": state.request_idempotency_key,
         }
 
     @staticmethod
@@ -719,8 +808,34 @@ class WorkspaceAgent:
             "tool_result_character_count",
             "tool_result_budget_exhausted",
         }
-        if not isinstance(payload, dict) or set(payload) != required_keys:
+        if (
+            not isinstance(payload, dict)
+            or frozenset(payload)
+            not in {
+                frozenset(required_keys),
+                frozenset(
+                    {
+                        *required_keys,
+                        "request_idempotency_key",
+                    }
+                ),
+            }
+        ):
             raise ValueError("待审批轮次状态字段非法")
+        request_idempotency_key = payload.get(
+            "request_idempotency_key"
+        )
+        if (
+            request_idempotency_key is not None
+            and (
+                not isinstance(request_idempotency_key, str)
+                or IDEMPOTENCY_KEY_PATTERN.fullmatch(
+                    request_idempotency_key
+                )
+                is None
+            )
+        ):
+            raise ValueError("待审批请求幂等键非法")
         integer_fields = (
             "model_call_count",
             "tool_call_count",
@@ -770,6 +885,7 @@ class WorkspaceAgent:
             tool_result_budget_exhausted=(
                 payload["tool_result_budget_exhausted"]
             ),
+            request_idempotency_key=request_idempotency_key,
         )
 
     def _committed_snapshot_hash(self) -> str:
@@ -1498,7 +1614,27 @@ class WorkspaceAgent:
 
         try:
             cancellation_token.raise_if_cancelled()
-            for chunk in active_model.stream(working_messages):
+            stream_method = getattr(active_model, "stream", None)
+            async_stream_method = getattr(active_model, "astream", None)
+            if (
+                self._prefer_async_execution
+                and callable(async_stream_method)
+            ):
+                chunks = iterate_async_synchronously(
+                    async_stream_method(working_messages)
+                )
+            elif callable(stream_method):
+                chunks = stream_method(working_messages)
+            elif callable(async_stream_method):
+                chunks = iterate_async_synchronously(
+                    async_stream_method(working_messages)
+                )
+            else:
+                raise TypeError(
+                    "模型必须实现 stream() 或 astream()"
+                )
+
+            for chunk in chunks:
                 cancellation_token.raise_if_cancelled()
                 if first_chunk_at is None:
                     first_chunk_at = self.monotonic_clock()
@@ -1857,10 +1993,51 @@ class WorkspaceAgent:
 
         execution_started_at = self.monotonic_clock()
         try:
+            execution_policy = (
+                self.tool_execution_middleware.policy_for(tool_name)
+            )
+            idempotency_key = internal_args.get("idempotency_key")
+            if (
+                idempotency_key is None
+                and state.request_idempotency_key is not None
+            ):
+                idempotency_key = hashlib.sha256(
+                    (
+                        f"{state.request_idempotency_key}\0"
+                        f"{tool_call_id}\0{tool_name}"
+                    ).encode("utf-8")
+                ).hexdigest()
             if prepared_action is not None:
                 action = prepared_action.execute
+            elif execution_policy.cooperative_cancellation:
+                cooperative_invoke = getattr(
+                    selected_tool,
+                    "invoke_with_cancellation",
+                    None,
+                )
+                if not callable(cooperative_invoke):
+                    raise TypeError(
+                        "协作式取消工具必须实现 "
+                        "invoke_with_cancellation(args, cancellation_token)"
+                    )
+
+                def action(cancellation_token):
+                    if execution_policy.risk == "external_side_effect":
+                        return cooperative_invoke(
+                            deepcopy(internal_args),
+                            cancellation_token,
+                            idempotency_key=idempotency_key,
+                        )
+                    return cooperative_invoke(
+                        deepcopy(internal_args),
+                        cancellation_token,
+                    )
             else:
-                action = lambda: selected_tool.invoke(internal_args)
+                action = lambda: self._invoke_registered_tool(
+                    selected_tool,
+                    internal_args,
+                    idempotency_key=idempotency_key,
+                )
             cancellation_token = self._active_cancellation_token
             if cancellation_token is None:
                 raise ToolExecutionCancelled(
@@ -1870,6 +2047,7 @@ class WorkspaceAgent:
                 tool_name,
                 action,
                 cancellation_token,
+                idempotency_key=idempotency_key,
             )
         except ToolExecutionCancelled:
             execution_finished_at = self.monotonic_clock()
@@ -2096,6 +2274,57 @@ class WorkspaceAgent:
         parse_obj = getattr(input_schema, "parse_obj", None)
         if callable(parse_obj):
             parse_obj(tool_args)
+
+    def _invoke_registered_tool(
+        self,
+        selected_tool,
+        tool_args: dict,
+        *,
+        idempotency_key: str | None = None,
+    ):
+        coroutine = getattr(selected_tool, "coroutine", None)
+        synchronous_function = getattr(selected_tool, "func", None)
+        async_invoke = getattr(selected_tool, "ainvoke", None)
+        if (
+            self._prefer_async_execution
+            and callable(async_invoke)
+            and callable(coroutine)
+        ):
+            return run_coroutine_synchronously(
+                async_invoke(
+                    deepcopy(tool_args),
+                    config=self._tool_invocation_config(
+                        idempotency_key
+                    ),
+                )
+            )
+        if callable(synchronous_function) or not callable(async_invoke):
+            return selected_tool.invoke(
+                deepcopy(tool_args),
+                config=self._tool_invocation_config(
+                    idempotency_key
+                ),
+            )
+        return run_coroutine_synchronously(
+            async_invoke(
+                deepcopy(tool_args),
+                config=self._tool_invocation_config(
+                    idempotency_key
+                ),
+            )
+        )
+
+    @staticmethod
+    def _tool_invocation_config(
+        idempotency_key: str | None,
+    ) -> dict | None:
+        if idempotency_key is None:
+            return None
+        return {
+            "configurable": {
+                "idempotency_key": idempotency_key,
+            }
+        }
 
     def _append_tool_message(
         self,

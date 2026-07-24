@@ -8,8 +8,11 @@ import math
 import os
 import stat
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
+import fcntl
 from langchain_core.embeddings import Embeddings
 
 
@@ -18,6 +21,8 @@ INDEX_DIRECTORY_NAME = ".knowledge_index"
 MAX_INDEX_BYTES = 100 * 1024 * 1024
 MAX_INDEX_ENTRIES = 100_000
 MAX_VECTOR_DIMENSIONS = 65_536
+DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+DEFAULT_LOCK_POLL_SECONDS = 0.05
 
 
 class KnowledgeIndexCacheError(RuntimeError):
@@ -54,6 +59,9 @@ class IncrementalEmbeddingIndex:
         workspace_root: str | os.PathLike[str],
         knowledge_directory: str | os.PathLike[str],
         embedding_fingerprint: str,
+        *,
+        lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+        lock_poll_seconds: float = DEFAULT_LOCK_POLL_SECONDS,
     ) -> None:
         workspace = Path(workspace_root)
         if workspace.is_symlink():
@@ -93,10 +101,27 @@ class IncrementalEmbeddingIndex:
             separators=(",", ":"),
         ).encode("utf-8")
         namespace = hashlib.sha256(namespace_payload).hexdigest()
+        for name, value in (
+            ("lock_timeout_seconds", lock_timeout_seconds),
+            ("lock_poll_seconds", lock_poll_seconds),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise KnowledgeIndexCacheError(
+                    f"{name} must be a positive finite number."
+                )
         self.embedding_fingerprint = embedding_fingerprint
         self.root = self.workspace_root / INDEX_DIRECTORY_NAME
         self.path = self.root / f"{namespace}.json"
-        self._entries = self._load()
+        self.lock_path = self.root / f"{namespace}.lock"
+        self.lock_timeout_seconds = float(lock_timeout_seconds)
+        self.lock_poll_seconds = float(lock_poll_seconds)
+        with self._file_lock():
+            self._entries = self._load()
 
     @staticmethod
     def content_key(text: str) -> str:
@@ -197,8 +222,80 @@ class IncrementalEmbeddingIndex:
                 "Knowledge index exceeds its size limit."
             )
 
-        self._atomic_write(encoded)
-        self._entries = normalized_entries
+        with self._file_lock():
+            self._atomic_write(encoded)
+            self._entries = normalized_entries
+
+    def _prepare_root(self) -> None:
+        if self.root.is_symlink():
+            raise KnowledgeIndexCacheError(
+                "Knowledge index directory cannot be a symbolic link."
+            )
+        try:
+            if self.root.exists():
+                if not self.root.is_dir():
+                    raise KnowledgeIndexCacheError(
+                        "Knowledge index root is not a directory."
+                    )
+            else:
+                self.root.mkdir(mode=0o700)
+            os.chmod(self.root, 0o700)
+        except KnowledgeIndexCacheError:
+            raise
+        except OSError:
+            raise KnowledgeIndexCacheError(
+                "Knowledge index directory could not be prepared."
+            ) from None
+
+    @contextmanager
+    def _file_lock(self):
+        """Hold an exclusive, cross-process lock for this index namespace."""
+        self._prepare_root()
+        if self.lock_path.is_symlink():
+            raise KnowledgeIndexCacheError(
+                "Knowledge index lock cannot be a symbolic link."
+            )
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            lock_fd = os.open(self.lock_path, flags, 0o600)
+        except OSError:
+            raise KnowledgeIndexCacheError(
+                "Knowledge index lock could not be opened safely."
+            ) from None
+
+        acquired = False
+        try:
+            lock_stat = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_stat.st_mode):
+                raise KnowledgeIndexCacheError(
+                    "Knowledge index lock is not a regular file."
+                )
+            os.fchmod(lock_fd, 0o600)
+            deadline = time.monotonic() + self.lock_timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(
+                        lock_fd,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise KnowledgeIndexCacheError(
+                            "Timed out waiting for the knowledge index lock."
+                        ) from None
+                    time.sleep(self.lock_poll_seconds)
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def _load(self) -> dict[str, list[float]]:
         if self.root.is_symlink() or self.path.is_symlink():
@@ -290,25 +387,7 @@ class IncrementalEmbeddingIndex:
         return entries
 
     def _atomic_write(self, encoded: bytes) -> None:
-        if self.root.is_symlink():
-            raise KnowledgeIndexCacheError(
-                "Knowledge index directory cannot be a symbolic link."
-            )
-        try:
-            if self.root.exists():
-                if not self.root.is_dir():
-                    raise KnowledgeIndexCacheError(
-                        "Knowledge index root is not a directory."
-                    )
-            else:
-                self.root.mkdir(mode=0o700)
-            os.chmod(self.root, 0o700)
-        except KnowledgeIndexCacheError:
-            raise
-        except OSError:
-            raise KnowledgeIndexCacheError(
-                "Knowledge index directory could not be prepared."
-            ) from None
+        self._prepare_root()
 
         temporary_path = None
         try:

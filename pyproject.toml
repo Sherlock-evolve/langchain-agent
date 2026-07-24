@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workspace-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A safe, persistent and auditable LangChain workspace agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cryptography==49.0.0",
+    "fastapi==0.139.2",
     "langchain-core==1.5.0",
     "langchain-openai==1.4.0",
     "langchain-text-splitters==1.1.2",
     "numpy==2.2.6",
     "python-dotenv==1.2.2",
+    "uvicorn==0.51.0",
 ]
 
 [project.optional-dependencies]
@@ -23,10 +26,12 @@ dev = [
 
 [project.scripts]
 workspace-agent = "main:main"
+workspace-agent-api = "web_service:main"
 
 [tool.setuptools]
 py-modules = [
     "agent",
+    "async_runtime",
     "audit_log",
     "citations",
     "contracts",
@@ -38,14 +43,21 @@ py-modules = [
     "knowledge_tools",
     "main",
     "persistent_session",
+    "production_runtime",
+    "quality_gate",
     "rag_evaluation",
     "session_store",
+    "storage_security",
     "tool_execution",
     "tools",
+    "web_service",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_model: opt-in test against a configured external chat model",
+]
 addopts = [
     "-p", "no:launch_pytest",
     "-p", "no:launch_testing",

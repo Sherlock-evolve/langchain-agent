@@ -2,8 +2,10 @@ import time
 from collections import deque
 from threading import Event, Thread
 
+import pytest
 from langchain_core.messages import AIMessageChunk
-from langchain_core.tools import StructuredTool
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import StructuredTool, tool
 
 from agent import WorkspaceAgent
 from contracts import (
@@ -14,8 +16,12 @@ from contracts import (
 )
 from tool_execution import (
     CancellationToken,
+    ToolCircuitOpen,
+    ToolExecutionBudgetExceeded,
+    ToolIdempotencyKeyRequired,
     ToolExecutionMiddleware,
     ToolExecutionPolicy,
+    ToolPolicyNotRegistered,
 )
 
 
@@ -196,3 +202,210 @@ def test_side_effect_policy_finishes_started_atomic_boundary():
 
     assert outcome == ["committed"]
     assert not worker.is_alive()
+
+
+def test_strict_registration_rejects_tools_without_risk_policy():
+    middleware = ToolExecutionMiddleware(
+        {},
+        require_registered_policies=True,
+    )
+
+    with pytest.raises(ToolPolicyNotRegistered, match="unregistered"):
+        middleware.execute(
+            "unregistered",
+            lambda: "unsafe-default",
+            CancellationToken(),
+        )
+
+
+def test_read_only_retry_uses_bounded_backoff_then_succeeds():
+    attempts = []
+    sleeps = []
+    middleware = ToolExecutionMiddleware(
+        {
+            "flaky_read": ToolExecutionPolicy(
+                risk="read_only",
+                timeout_seconds=1,
+                max_attempts=3,
+                initial_backoff_seconds=0.1,
+                max_backoff_seconds=0.1,
+            )
+        },
+        poll_interval_seconds=0.05,
+        sleeper=sleeps.append,
+    )
+
+    def action():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise OSError("transient")
+        return "stable"
+
+    assert middleware.execute(
+        "flaky_read",
+        action,
+        CancellationToken(),
+    ) == "stable"
+    assert attempts == [1, 2, 3]
+    assert sum(sleeps) == pytest.approx(0.2)
+
+
+def test_external_side_effect_retries_only_with_idempotency_key():
+    attempts = []
+    middleware = ToolExecutionMiddleware(
+        {
+            "external": ToolExecutionPolicy(
+                risk="external_side_effect",
+                timeout_seconds=None,
+                abandon_on_cancel=False,
+                max_attempts=2,
+                initial_backoff_seconds=0,
+            )
+        }
+    )
+
+    def action():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise OSError("retryable")
+        return "created-once"
+
+    with pytest.raises(ToolIdempotencyKeyRequired):
+        middleware.execute(
+            "external",
+            action,
+            CancellationToken(),
+        )
+    assert attempts == []
+
+    assert middleware.execute(
+        "external",
+        action,
+        CancellationToken(),
+        idempotency_key="request-123",
+    ) == "created-once"
+    assert attempts == [1, 2]
+
+
+def test_circuit_breaker_opens_after_consecutive_failures():
+    calls = []
+    middleware = ToolExecutionMiddleware(
+        {
+            "unstable": ToolExecutionPolicy(
+                risk="read_only",
+                timeout_seconds=1,
+                circuit_failure_threshold=2,
+                circuit_recovery_seconds=60,
+            )
+        }
+    )
+
+    def fail():
+        calls.append("called")
+        raise RuntimeError("down")
+
+    with pytest.raises(RuntimeError, match="down"):
+        middleware.execute("unstable", fail, CancellationToken())
+    with pytest.raises(RuntimeError, match="down"):
+        middleware.execute("unstable", fail, CancellationToken())
+    with pytest.raises(ToolCircuitOpen):
+        middleware.execute("unstable", fail, CancellationToken())
+    assert calls == ["called", "called"]
+
+
+def test_cooperative_action_receives_deadline_aware_child_token():
+    observed = []
+    middleware = ToolExecutionMiddleware(
+        {
+            "cooperative": ToolExecutionPolicy(
+                risk="read_only",
+                timeout_seconds=1,
+                cooperative_cancellation=True,
+                total_budget_seconds=1,
+            )
+        }
+    )
+
+    def action(token):
+        observed.append(token)
+        token.raise_if_cancelled()
+        return token.remaining_seconds
+
+    remaining = middleware.execute(
+        "cooperative",
+        action,
+        CancellationToken(),
+    )
+    assert len(observed) == 1
+    assert isinstance(observed[0], CancellationToken)
+    assert 0 < remaining <= 1
+
+
+def test_cooperative_action_observes_total_budget():
+    middleware = ToolExecutionMiddleware(
+        {
+            "budgeted": ToolExecutionPolicy(
+                risk="read_only",
+                timeout_seconds=1,
+                cooperative_cancellation=True,
+                total_budget_seconds=0.01,
+            )
+        },
+        poll_interval_seconds=0.001,
+    )
+
+    def action(token):
+        while True:
+            time.sleep(0.002)
+            token.raise_if_cancelled()
+
+    with pytest.raises(ToolExecutionBudgetExceeded):
+        middleware.execute(
+            "budgeted",
+            action,
+            CancellationToken(),
+        )
+
+
+def test_turn_request_idempotency_key_is_injected_into_external_tool():
+    observed_keys = []
+
+    @tool
+    def external_create(config: RunnableConfig) -> str:
+        """Create one external resource idempotently."""
+        observed_keys.append(
+            config["configurable"]["idempotency_key"]
+        )
+        return "created"
+
+    model = ScriptedModel(
+        [
+            tool_call_response("external_create", "external-call"),
+            [AIMessageChunk(content="done")],
+        ]
+    )
+    agent = WorkspaceAgent(
+        model=model,
+        tools=[external_create],
+        tool_execution_policies={
+            "external_create": ToolExecutionPolicy(
+                risk="external_side_effect",
+                timeout_seconds=None,
+                abandon_on_cancel=False,
+            )
+        },
+    )
+
+    list(
+        agent.stream_turn(
+            "create",
+            request_idempotency_key="request-123",
+        )
+    )
+
+    assert len(observed_keys) == 1
+    assert len(observed_keys[0]) == 64
+    assert all(
+        character in "0123456789abcdef"
+        for character in observed_keys[0]
+    )

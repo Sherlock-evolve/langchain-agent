@@ -4,14 +4,20 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, StructuredTool, tool
 
 from contracts import PreparedToolAction, ToolActionConflictError
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
+_BOUND_WORKSPACE_ROOT: ContextVar[Path | None] = ContextVar(
+    "workspace_agent_bound_root",
+    default=None,
+)
 IGNORED_DIRECTORIES = {
     ".agent_audit",
     ".agent_sessions",
@@ -35,6 +41,23 @@ MAX_READ_BODY_CHARACTERS = 19_700
 MAX_LIST_ENTRIES = 200
 MAX_WRITE_PREVIEW_CHARACTERS = 8_000
 WRITE_PREVIEW_TRUNCATION_MARKER = "\n[预览已截断]"
+
+
+def _workspace_root() -> Path:
+    return _BOUND_WORKSPACE_ROOT.get() or WORKSPACE_ROOT
+
+
+def _validated_workspace_root(root: Path | str) -> Path:
+    candidate = Path(root)
+    if candidate.is_symlink():
+        raise ValueError("工作区根目录不能是符号链接")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        raise ValueError("工作区根目录不存在") from None
+    if not resolved.is_dir():
+        raise ValueError("工作区根路径不是目录")
+    return resolved
 
 
 def _is_sensitive_name(name: str) -> bool:
@@ -72,9 +95,10 @@ def _resolve_workspace_path(path: str) -> Path:
     if _is_hidden_path(relative_path):
         raise ValueError("不允许访问被忽略或敏感的路径")
 
-    resolved_path = (WORKSPACE_ROOT / relative_path).resolve()
+    workspace_root = _workspace_root()
+    resolved_path = (workspace_root / relative_path).resolve()
     try:
-        resolved_relative_path = resolved_path.relative_to(WORKSPACE_ROOT)
+        resolved_relative_path = resolved_path.relative_to(workspace_root)
     except ValueError as error:
         raise ValueError("路径超出当前项目目录") from error
 
@@ -164,7 +188,7 @@ def _build_write_preview(
     old_content: str,
     new_content: str,
 ) -> str:
-    display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
+    display_path = file_path.relative_to(_workspace_root()).as_posix()
     preview = "".join(
         difflib.unified_diff(
             old_content.splitlines(keepends=True),
@@ -201,14 +225,14 @@ def list_files(directory: str = ".") -> str:
 
         resolved_entry = entry.resolve()
         try:
-            relative_entry = resolved_entry.relative_to(WORKSPACE_ROOT)
+            relative_entry = resolved_entry.relative_to(_workspace_root())
         except ValueError:
             continue
 
         if _is_hidden_path(relative_entry):
             continue
 
-        display_path = entry.relative_to(WORKSPACE_ROOT).as_posix()
+        display_path = entry.relative_to(_workspace_root()).as_posix()
         if resolved_entry.is_dir():
             display_path += "/"
         entries.append(display_path)
@@ -425,7 +449,9 @@ def search_text(query: str, directory: str = ".") -> str:
                 continue
 
             try:
-                relative_child = child_directory.resolve().relative_to(WORKSPACE_ROOT)
+                relative_child = child_directory.resolve().relative_to(
+                    _workspace_root()
+                )
             except (OSError, ValueError):
                 continue
 
@@ -442,7 +468,7 @@ def search_text(query: str, directory: str = ".") -> str:
 
             try:
                 resolved_file = file_path.resolve()
-                relative_file = resolved_file.relative_to(WORKSPACE_ROOT)
+                relative_file = resolved_file.relative_to(_workspace_root())
             except (OSError, ValueError):
                 continue
 
@@ -458,7 +484,9 @@ def search_text(query: str, directory: str = ".") -> str:
             except (OSError, UnicodeError):
                 continue
 
-            display_path = file_path.relative_to(WORKSPACE_ROOT).as_posix()
+            display_path = file_path.relative_to(
+                _workspace_root()
+            ).as_posix()
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if query not in line:
                     continue
@@ -487,3 +515,109 @@ def search_text(query: str, directory: str = ".") -> str:
         results.append("结果已截断")
 
     return "\n".join(results)
+
+
+@dataclass(frozen=True)
+class WorkspaceToolBundle:
+    """Workspace-bound tools and their approval preparers."""
+
+    tools: tuple[BaseTool, ...]
+    approval_preparers: dict[str, Callable[..., PreparedToolAction]]
+
+
+def create_workspace_tool_bundle(
+    workspace_root: Path | str,
+) -> WorkspaceToolBundle:
+    """Create concurrency-safe tools bound to one tenant workspace."""
+
+    root = _validated_workspace_root(workspace_root)
+
+    def run_bound(function, *args, **kwargs):
+        context_token = _BOUND_WORKSPACE_ROOT.set(root)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _BOUND_WORKSPACE_ROOT.reset(context_token)
+
+    def bound_list_files(directory: str = ".") -> str:
+        """列出租户工作区指定目录的直接子项。"""
+        return run_bound(list_files.func, directory=directory)
+
+    def bound_read_file(
+        path: str,
+        start_line: int = 1,
+        line_count: int = 200,
+    ) -> str:
+        """读取租户工作区文本文件的指定行范围。"""
+        return run_bound(
+            read_file.func,
+            path=path,
+            start_line=start_line,
+            line_count=line_count,
+        )
+
+    def bound_write_file(path: str, content: str) -> str:
+        """原子创建或更新租户工作区文本文件。"""
+        return run_bound(
+            write_file.func,
+            path=path,
+            content=content,
+        )
+
+    def bound_search_text(
+        query: str,
+        directory: str = ".",
+    ) -> str:
+        """在租户工作区中递归搜索文本。"""
+        return run_bound(
+            search_text.func,
+            query=query,
+            directory=directory,
+        )
+
+    def bound_prepare_write_file(
+        path: str,
+        content: str,
+    ) -> PreparedToolAction:
+        prepared = run_bound(
+            prepare_write_file,
+            path=path,
+            content=content,
+        )
+
+        def execute() -> str:
+            return run_bound(prepared.execute)
+
+        return PreparedToolAction(
+            preview=prepared.preview,
+            execute=execute,
+        )
+
+    bound_tools = (
+        StructuredTool.from_function(
+            func=bound_list_files,
+            name="list_files",
+            description=list_files.description,
+        ),
+        StructuredTool.from_function(
+            func=bound_read_file,
+            name="read_file",
+            description=read_file.description,
+        ),
+        StructuredTool.from_function(
+            func=bound_search_text,
+            name="search_text",
+            description=search_text.description,
+        ),
+        StructuredTool.from_function(
+            func=bound_write_file,
+            name="write_file",
+            description=write_file.description,
+        ),
+    )
+    return WorkspaceToolBundle(
+        tools=bound_tools,
+        approval_preparers={
+            "write_file": bound_prepare_write_file,
+        },
+    )

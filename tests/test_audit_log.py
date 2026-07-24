@@ -1,5 +1,7 @@
 import json
+import os
 import stat
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -594,3 +596,35 @@ def test_approval_resolution_envelope_and_audit_hide_wrong_decision_id(
     assert wrong_id not in raw_log
     assert "PROTECTED-ARGUMENT" not in raw_log
     assert AUDIT_TOOL_EXECUTIONS == []
+
+
+def test_audit_rotation_retention_and_explicit_deletion(tmp_path):
+    root = tmp_path / ".agent_audit"
+    logger = make_logger(
+        root,
+        max_log_bytes=350,
+        rotation_count=2,
+        retention_days=1,
+    )
+    for sequence in range(1, 7):
+        logger.record(
+            make_envelope(
+                TokenEvent(text="x" * 100),
+                sequence=sequence,
+            )
+        )
+
+    current = root / "audit-session.jsonl"
+    rotated = root / "audit-session.jsonl.1"
+    assert current.is_file()
+    assert rotated.is_file()
+    assert len(list(root.glob("audit-session.jsonl*"))) <= 3
+
+    old_timestamp = time.time() - 2 * 24 * 60 * 60
+    os.utime(rotated, (old_timestamp, old_timestamp))
+    assert logger.prune_expired() == 1
+    assert not rotated.exists()
+
+    removed = logger.delete_session_logs("audit-session")
+    assert removed >= 1
+    assert list(root.glob("audit-session.jsonl*")) == []

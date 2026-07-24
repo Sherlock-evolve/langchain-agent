@@ -1,9 +1,10 @@
 import json
 import os
 import stat
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 
 import session_store
 from contracts import (
@@ -48,7 +49,7 @@ class AuditLogLimitError(AuditLogError):
 class JsonlAuditLogger:
     """将事件信封按白名单编码后安全追加到独立 JSONL 日志。"""
 
-    _process_lock = Lock()
+    _process_lock = RLock()
 
     def __init__(
         self,
@@ -56,6 +57,8 @@ class JsonlAuditLogger:
         timestamp_factory=None,
         max_record_bytes: int = MAX_AUDIT_RECORD_BYTES,
         max_log_bytes: int = MAX_AUDIT_LOG_BYTES,
+        rotation_count: int = 0,
+        retention_days: int | None = None,
     ):
         if timestamp_factory is not None and not callable(timestamp_factory):
             raise TypeError("timestamp_factory 必须可调用")
@@ -65,6 +68,16 @@ class JsonlAuditLogger:
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} 必须是正整数")
+        if type(rotation_count) is not int or rotation_count < 0:
+            raise ValueError("rotation_count 必须是非负整数")
+        if (
+            retention_days is not None
+            and (
+                type(retention_days) is not int
+                or retention_days < 1
+            )
+        ):
+            raise ValueError("retention_days 必须是正整数或 None")
 
         self.root = (
             Path(root)
@@ -78,6 +91,9 @@ class JsonlAuditLogger:
         )
         self.max_record_bytes = max_record_bytes
         self.max_log_bytes = max_log_bytes
+        self.rotation_count = rotation_count
+        self.retention_days = retention_days
+        self._retention_checked = False
 
     def record(self, envelope: EventEnvelope) -> None:
         try:
@@ -88,6 +104,12 @@ class JsonlAuditLogger:
         except Exception as error:
             raise AuditLogError("审计事件字段非法") from error
         with self._process_lock:
+            if (
+                self.retention_days is not None
+                and not self._retention_checked
+            ):
+                self.prune_expired()
+                self._retention_checked = True
             self._append_line(envelope.session_id, encoded_line)
 
     def _build_record(self, envelope: EventEnvelope) -> dict:
@@ -310,7 +332,23 @@ class JsonlAuditLogger:
             if file_stat.st_size > self.max_log_bytes:
                 raise AuditLogLimitError("审计日志已超过总大小限制")
             if file_stat.st_size + len(encoded_line) > self.max_log_bytes:
-                raise AuditLogLimitError("追加后将超过审计日志总大小限制")
+                if self.rotation_count < 1:
+                    raise AuditLogLimitError(
+                        "追加后将超过审计日志总大小限制"
+                    )
+                os.close(audit_fd)
+                audit_fd = None
+                self._rotate_files(
+                    directory_fd,
+                    filename,
+                )
+                file_existed = False
+                audit_fd = os.open(
+                    filename,
+                    flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
 
             os.fchmod(audit_fd, 0o600)
             with os.fdopen(audit_fd, "ab") as audit_file:
@@ -328,6 +366,99 @@ class JsonlAuditLogger:
             if audit_fd is not None:
                 os.close(audit_fd)
             os.close(directory_fd)
+
+    def _rotate_files(
+        self,
+        directory_fd: int,
+        filename: str,
+    ) -> None:
+        oldest = f"{filename}.{self.rotation_count}"
+        if self._validate_existing_file(directory_fd, oldest):
+            os.unlink(oldest, dir_fd=directory_fd)
+        for index in range(self.rotation_count - 1, 0, -1):
+            source = f"{filename}.{index}"
+            destination = f"{filename}.{index + 1}"
+            if self._validate_existing_file(directory_fd, source):
+                os.replace(
+                    source,
+                    destination,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+        if self._validate_existing_file(directory_fd, filename):
+            os.replace(
+                filename,
+                f"{filename}.1",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        os.fsync(directory_fd)
+
+    def prune_expired(self) -> int:
+        """Delete regular audit files older than the retention window."""
+        with self._process_lock:
+            if self.retention_days is None:
+                return 0
+            directory_fd = self._open_audit_directory()
+            removed = 0
+            cutoff = time.time() - self.retention_days * 24 * 60 * 60
+            try:
+                for entry in self.root.iterdir():
+                    if not (
+                        entry.name.endswith(AUDIT_FILE_SUFFIX)
+                        or f"{AUDIT_FILE_SUFFIX}." in entry.name
+                    ):
+                        continue
+                    try:
+                        file_stat = os.stat(
+                            entry.name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        continue
+                    if (
+                        stat.S_ISREG(file_stat.st_mode)
+                        and file_stat.st_mtime < cutoff
+                    ):
+                        os.unlink(entry.name, dir_fd=directory_fd)
+                        removed += 1
+                if removed:
+                    os.fsync(directory_fd)
+                return removed
+            finally:
+                os.close(directory_fd)
+
+    def delete_session_logs(self, session_id: str) -> int:
+        """Delete current and rotated logs for one explicit session."""
+        with self._process_lock:
+            self._validate_session_id(session_id)
+            directory_fd = self._open_audit_directory()
+            removed = 0
+            try:
+                filename = f"{session_id}{AUDIT_FILE_SUFFIX}"
+                candidates = [
+                    filename,
+                    *[
+                        f"{filename}.{index}"
+                        for index in range(
+                            1,
+                            self.rotation_count + 1,
+                        )
+                    ],
+                ]
+                for candidate in candidates:
+                    if self._validate_existing_file(
+                        directory_fd,
+                        candidate,
+                    ):
+                        os.unlink(candidate, dir_fd=directory_fd)
+                        removed += 1
+                if removed:
+                    os.fsync(directory_fd)
+                return removed
+            finally:
+                os.close(directory_fd)
 
     def _open_audit_directory(self) -> int:
         try:

@@ -32,4 +32,8 @@ jobs:
         run: python -m compileall -q .
 
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q --junitxml=test-results.xml
+
+      - name: Release gate
+        if: always()
+        run: python quality_gate.py test-results.xml --min-tests 150

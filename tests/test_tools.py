@@ -1,3 +1,5 @@
+from threading import Thread
+
 import pytest
 
 import tools as workspace_tools
@@ -127,3 +129,47 @@ def test_sensitive_files_cannot_be_read_or_searched(
 
     assert listing == ["public.txt"]
     assert search_result == "未找到匹配结果"
+
+
+def test_bound_workspace_tools_isolate_concurrent_tenants(tmp_path):
+    alice_root = tmp_path / "alice"
+    bob_root = tmp_path / "bob"
+    alice_root.mkdir()
+    bob_root.mkdir()
+    (alice_root / "note.txt").write_text("alice", encoding="utf-8")
+    (bob_root / "note.txt").write_text("bob", encoding="utf-8")
+    alice = workspace_tools.create_workspace_tool_bundle(alice_root)
+    bob = workspace_tools.create_workspace_tool_bundle(bob_root)
+    alice_read = next(tool for tool in alice.tools if tool.name == "read_file")
+    bob_read = next(tool for tool in bob.tools if tool.name == "read_file")
+    results = {}
+
+    first = Thread(
+        target=lambda: results.setdefault(
+            "alice",
+            alice_read.invoke({"path": "note.txt"}),
+        )
+    )
+    second = Thread(
+        target=lambda: results.setdefault(
+            "bob",
+            bob_read.invoke({"path": "note.txt"}),
+        )
+    )
+    first.start()
+    second.start()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert results["alice"].endswith("alice")
+    assert results["bob"].endswith("bob")
+
+    prepared = alice.approval_preparers["write_file"](
+        path="note.txt",
+        content="alice-updated",
+    )
+    prepared.execute()
+    assert (alice_root / "note.txt").read_text(
+        encoding="utf-8"
+    ) == "alice-updated"
+    assert (bob_root / "note.txt").read_text(encoding="utf-8") == "bob"

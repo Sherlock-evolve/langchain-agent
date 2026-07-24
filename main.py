@@ -36,6 +36,10 @@ from persistent_session import (
     PersistentSession,
     PersistentSessionSaveError,
 )
+from tool_execution import (
+    ToolExecutionMiddleware,
+    ToolExecutionPolicy,
+)
 from tools import (
     list_files,
     prepare_write_file,
@@ -225,6 +229,19 @@ def create_workspace_agent(
     ]
     if extra_tools is not None:
         registered_tools.extend(tuple(extra_tools))
+    execution_policies = {
+        registered_tool.name: ToolExecutionPolicy(
+            risk="read_only",
+            timeout_seconds=30.0,
+            abandon_on_cancel=True,
+        )
+        for registered_tool in registered_tools
+    }
+    execution_policies[write_file.name] = ToolExecutionPolicy(
+        risk="workspace_write",
+        timeout_seconds=None,
+        abandon_on_cancel=False,
+    )
     agent = WorkspaceAgent(
         model=model,
         tools=registered_tools,
@@ -233,6 +250,10 @@ def create_workspace_agent(
         citation_validator=citation_validator,
         citation_policy=citation_policy,
         citation_guard_tool_names=set(citation_guard_tool_names or ()),
+        tool_execution_middleware=ToolExecutionMiddleware(
+            execution_policies,
+            require_registered_policies=True,
+        ),
     )
     return agent
 

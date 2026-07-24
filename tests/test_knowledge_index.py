@@ -3,6 +3,10 @@ import json
 import pytest
 from langchain_core.embeddings import Embeddings
 
+from knowledge_index import (
+    IncrementalEmbeddingIndex,
+    KnowledgeIndexCacheError,
+)
 from knowledge_runtime import (
     KnowledgeEmbeddingError,
     create_knowledge_runtime,
@@ -113,3 +117,37 @@ def test_corrupt_or_symlinked_incremental_index_fails_closed(
     with pytest.raises(KnowledgeEmbeddingError):
         runtime(tmp_path, CountingEmbeddings())
     assert outside.read_text(encoding="utf-8") == "{}"
+
+
+def test_incremental_index_uses_bounded_cross_process_file_lock(
+    tmp_path,
+):
+    fingerprint = "a" * 64
+    index = IncrementalEmbeddingIndex(
+        tmp_path,
+        "docs",
+        fingerprint,
+        lock_timeout_seconds=0.02,
+        lock_poll_seconds=0.005,
+    )
+
+    with index._file_lock():
+        with pytest.raises(
+            KnowledgeIndexCacheError,
+            match="Timed out",
+        ):
+            IncrementalEmbeddingIndex(
+                tmp_path,
+                "docs",
+                fingerprint,
+                lock_timeout_seconds=0.02,
+                lock_poll_seconds=0.005,
+            )
+
+    reopened = IncrementalEmbeddingIndex(
+        tmp_path,
+        "docs",
+        fingerprint,
+    )
+    assert reopened.get("missing") is None
+    assert reopened.lock_path.stat().st_mode & 0o777 == 0o600
