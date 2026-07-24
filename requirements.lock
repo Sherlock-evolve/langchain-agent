@@ -19,6 +19,7 @@ langchain-openai==1.4.0
 langchain-protocol==0.0.18
 langchain-text-splitters==1.1.2
 langsmith==0.10.9
+numpy==2.2.6
 openai==2.46.0
 orjson==3.11.9
 packaging==26.2
