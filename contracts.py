@@ -97,6 +97,19 @@ class CitationValidationEvent:
 
 
 @dataclass(frozen=True)
+class CitationPolicyEvent:
+    policy: Literal["observe", "require_valid"]
+    action: Literal["observed", "allowed", "blocked"]
+    validation_status: Literal[
+        "valid",
+        "missing",
+        "unknown",
+        "not_applicable",
+        "error",
+    ]
+
+
+@dataclass(frozen=True)
 class ModelCallMetricsEvent:
     call_index: int
     status: Literal["success", "error"]
@@ -124,6 +137,7 @@ AgentEvent = (
     | ContextTrimmedEvent
     | MemoryUpdatedEvent
     | CitationValidationEvent
+    | CitationPolicyEvent
     | ModelCallMetricsEvent
     | SessionSavedEvent
 )

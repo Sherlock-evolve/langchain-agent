@@ -21,6 +21,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationPolicyEvent,
     CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
@@ -108,6 +109,11 @@ def test_audit_whitelists_every_known_event_type_and_rejects_unknown(
             valid_citation_count=2,
             unknown_citation_count=0,
             retrieved_chunk_count=3,
+        ),
+        CitationPolicyEvent(
+            policy="observe",
+            action="observed",
+            validation_status="valid",
         ),
         ModelCallMetricsEvent(
             call_index=2,

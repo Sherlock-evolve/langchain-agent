@@ -15,6 +15,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationPolicyEvent,
     CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
@@ -157,6 +158,13 @@ def render_event(event: AgentEvent) -> None:
             print("[引用] 本轮未使用知识检索")
         else:
             print("[引用] 校验失败")
+    elif isinstance(event, CitationPolicyEvent):
+        if event.action == "observed":
+            print("[引用策略] 已观测")
+        elif event.action == "allowed":
+            print("[引用策略] 校验通过，允许提交")
+        else:
+            print("[引用策略] 校验未通过，回答未提交")
     elif isinstance(event, ModelCallMetricsEvent):
         status_label = STATUS_LABELS[event.status]
         first_chunk = (
@@ -195,6 +203,8 @@ def _ensure_line_start() -> None:
 def create_workspace_agent(
     extra_tools: Iterable[BaseTool] | None = None,
     citation_validator: Callable | None = None,
+    citation_policy: str = "observe",
+    citation_guard_tool_names: set[str] | frozenset[str] | None = None,
 ) -> WorkspaceAgent:
     model = ChatOpenAI(
         model=os.getenv("ZHIPU_MODEL"),
@@ -216,6 +226,8 @@ def create_workspace_agent(
         approval_required_tools={write_file.name},
         approval_preparers={write_file.name: prepare_write_file},
         citation_validator=citation_validator,
+        citation_policy=citation_policy,
+        citation_guard_tool_names=set(citation_guard_tool_names or ()),
     )
     return agent
 
@@ -223,13 +235,20 @@ def create_workspace_agent(
 def create_workspace_agent_factory(
     extra_tools: Iterable[BaseTool],
     citation_validator: Callable | None = None,
+    citation_policy: str = "observe",
+    citation_guard_tool_names: set[str] | frozenset[str] | None = None,
 ) -> Callable[[], WorkspaceAgent]:
     shared_tools = tuple(extra_tools)
+    shared_guard_tool_names = frozenset(
+        citation_guard_tool_names or ()
+    )
 
     def agent_factory() -> WorkspaceAgent:
         return create_workspace_agent(
             extra_tools=shared_tools,
             citation_validator=citation_validator,
+            citation_policy=citation_policy,
+            citation_guard_tool_names=shared_guard_tool_names,
         )
 
     return agent_factory
@@ -515,6 +534,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         default="docs",
         help="工作区内的知识文档目录（默认：docs）",
     )
+    parser.add_argument(
+        "--citation-policy",
+        choices=("observe", "require-valid"),
+        default="observe",
+        help="引用策略（默认：observe）",
+    )
     return parser
 
 
@@ -524,6 +549,14 @@ def main(
 ) -> int:
     arguments = _build_argument_parser().parse_args(argv)
     load_dotenv()
+    citation_policy = arguments.citation_policy.replace("-", "_")
+
+    if (
+        citation_policy == "require_valid"
+        and not arguments.enable_knowledge
+    ):
+        print("[启动失败] require-valid 引用策略必须启用知识库")
+        return 2
 
     runtime = None
     agent_factory = create_workspace_agent
@@ -539,6 +572,10 @@ def main(
             agent_factory = create_workspace_agent_factory(
                 [runtime.search_tool],
                 citation_validator=runtime.citation_validator,
+                citation_policy=citation_policy,
+                citation_guard_tool_names=(
+                    runtime.citation_guard_tool_names
+                ),
             )
         except Exception:
             print("[知识库启动失败] 无法安全初始化知识库")

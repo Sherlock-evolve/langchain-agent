@@ -17,6 +17,7 @@ import session_store
 from agent import WorkspaceAgent
 from audit_log import AuditLogError, JsonlAuditLogger
 from contracts import (
+    CitationPolicyEvent,
     CitationValidationEvent,
     EventEnvelope,
     MemoryUpdatedEvent,
@@ -356,10 +357,17 @@ def test_event_order_is_metrics_validation_memory_then_session_save(
     event_types = [type(envelope.event) for envelope in envelopes]
     metrics_index = event_types.index(ModelCallMetricsEvent)
     citation_index = event_types.index(CitationValidationEvent)
+    policy_index = event_types.index(CitationPolicyEvent)
     memory_index = event_types.index(MemoryUpdatedEvent)
     saved_index = event_types.index(SessionSavedEvent)
 
-    assert metrics_index < citation_index < memory_index < saved_index
+    assert (
+        metrics_index
+        < citation_index
+        < policy_index
+        < memory_index
+        < saved_index
+    )
     assert saved_index == len(envelopes) - 1
     assert envelopes[citation_index].event.status == "not_applicable"
     assert session_store.load("citation-order") == agent.export_snapshot()

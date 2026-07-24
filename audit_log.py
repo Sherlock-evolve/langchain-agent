@@ -9,6 +9,7 @@ import session_store
 from contracts import (
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationPolicyEvent,
     CitationValidationEvent,
     ContextTrimmedEvent,
     EventEnvelope,
@@ -201,6 +202,28 @@ class JsonlAuditLogger:
                 "valid_citation_count": event.valid_citation_count,
                 "unknown_citation_count": event.unknown_citation_count,
                 "retrieved_chunk_count": event.retrieved_chunk_count,
+            }
+        if isinstance(event, CitationPolicyEvent):
+            if event.policy not in {"observe", "require_valid"}:
+                raise AuditLogError("引用策略不在允许范围内")
+            if event.action not in {
+                "observed",
+                "allowed",
+                "blocked",
+            }:
+                raise AuditLogError("引用策略动作不在允许范围内")
+            if event.validation_status not in {
+                "valid",
+                "missing",
+                "unknown",
+                "not_applicable",
+                "error",
+            }:
+                raise AuditLogError("引用策略校验状态不在允许范围内")
+            return "CitationPolicyEvent", {
+                "policy": event.policy,
+                "action": event.action,
+                "validation_status": event.validation_status,
             }
         if isinstance(event, ModelCallMetricsEvent):
             return "ModelCallMetricsEvent", {

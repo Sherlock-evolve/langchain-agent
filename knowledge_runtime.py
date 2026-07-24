@@ -34,6 +34,9 @@ class KnowledgeRuntime:
     chunk_count: int
     skipped_file_count: int
     citation_validator: Callable = validate_knowledge_citations
+    citation_guard_tool_names: frozenset[str] = frozenset(
+        {"search_knowledge"}
+    )
 
 
 class KnowledgeRuntimeError(RuntimeError):

@@ -4,6 +4,7 @@ from collections.abc import Callable, Generator
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Lock
+from typing import Literal
 
 from langchain_core.messages import (
     AIMessage,
@@ -21,6 +22,7 @@ from contracts import (
     ApprovalDecision,
     ApprovalRequiredEvent,
     ApprovalResolvedEvent,
+    CitationPolicyEvent,
     CitationValidationEvent,
     ContextTrimmedEvent,
     MemoryUpdatedEvent,
@@ -33,7 +35,6 @@ from contracts import (
     ToolCallEvent,
     ToolResultEvent,
 )
-from citations import CitationValidationResult
 
 
 SYSTEM_PROMPT = (
@@ -109,6 +110,11 @@ class WorkspaceAgent:
         ) = None,
         monotonic_clock: Callable[[], float] | None = None,
         citation_validator: Callable | None = None,
+        citation_policy: Literal[
+            "observe",
+            "require_valid",
+        ] = "observe",
+        citation_guard_tool_names: set[str] | None = None,
     ):
         configured_previewers = dict(approval_previewers or {})
         configured_preparers = dict(approval_preparers or {})
@@ -149,7 +155,26 @@ class WorkspaceAgent:
             citation_validator
         ):
             raise TypeError("citation_validator 必须可调用")
+        if citation_policy not in {"observe", "require_valid"}:
+            raise ValueError("citation_policy 必须是 observe 或 require_valid")
+        configured_guard_tool_names = set(
+            citation_guard_tool_names or ()
+        )
+        if any(
+            not isinstance(tool_name, str) or not tool_name
+            for tool_name in configured_guard_tool_names
+        ):
+            raise ValueError("citation_guard_tool_names 必须包含非空工具名")
+        if citation_policy == "require_valid" and (
+            citation_validator is None
+            or not configured_guard_tool_names
+        ):
+            raise ValueError(
+                "require_valid 必须配置引用校验器和至少一个门禁工具名"
+            )
         self.citation_validator = citation_validator
+        self.citation_policy = citation_policy
+        self.citation_guard_tool_names = configured_guard_tool_names
         self.tools_by_name = {tool.name: tool for tool in self.tools}
         self.model_with_tools = self.model.bind_tools(self.tools)
         self.messages = [SystemMessage(content=SYSTEM_PROMPT)]
@@ -381,13 +406,39 @@ class WorkspaceAgent:
             )
             active_model = self.model_with_tools if tools_allowed else self.model
             state.model_call_count += 1
-            response = yield from self._stream_response(
+            guarded_tool_used = self._guarded_tool_was_used(
+                working_messages[current_turn_start_index:]
+            )
+            buffer_candidate = (
+                self.citation_policy == "require_valid"
+                and guarded_tool_used
+            )
+            buffered_events = []
+            response_stream = self._stream_response(
                 active_model,
                 working_messages,
                 call_index=state.model_call_count,
             )
+            if buffer_candidate:
+                try:
+                    while True:
+                        buffered_events.append(next(response_stream))
+                except StopIteration as stopped:
+                    response = stopped.value
+                except Exception:
+                    for buffered_event in buffered_events:
+                        if isinstance(
+                            buffered_event,
+                            ModelCallMetricsEvent,
+                        ):
+                            yield buffered_event
+                    raise
+            else:
+                response = yield from response_stream
 
             if response is None:
+                if buffer_candidate:
+                    yield from buffered_events
                 yield SystemEvent(
                     message="模型未返回任何消息，当前任务已停止。"
                 )
@@ -400,17 +451,55 @@ class WorkspaceAgent:
                 citation_event = self._validate_current_turn_citations(
                     working_messages[current_turn_start_index:]
                 )
+                policy_event = self._citation_policy_event(
+                    citation_event,
+                    guarded_tool_used=guarded_tool_used,
+                )
+
+                if (
+                    buffer_candidate
+                    and (
+                        citation_event is None
+                        or citation_event.status != "valid"
+                    )
+                ):
+                    for buffered_event in buffered_events:
+                        if isinstance(
+                            buffered_event,
+                            ModelCallMetricsEvent,
+                        ):
+                            yield buffered_event
+                    if citation_event is not None:
+                        yield citation_event
+                    if policy_event is not None:
+                        yield policy_event
+                    yield SystemEvent(
+                        message=(
+                            "引用校验未通过，候选回答未提交。"
+                        )
+                    )
+                    task_stopped = True
+                    break
+
+                if buffer_candidate:
+                    yield from buffered_events
+
                 memory_changed = working_summary != self.memory_summary
                 self.messages = working_messages
                 self.memory_summary = working_summary
                 answered = True
                 if citation_event is not None:
                     yield citation_event
+                if policy_event is not None:
+                    yield policy_event
                 if memory_changed:
                     yield MemoryUpdatedEvent(
                         character_count=len(self.memory_summary),
                     )
                 break
+
+            if buffer_candidate:
+                yield from buffered_events
 
             for tool_call in response.tool_calls:
                 yield from self._execute_tool_call(
@@ -439,15 +528,16 @@ class WorkspaceAgent:
         try:
             immutable_messages = tuple(deepcopy(current_turn_messages))
             result = self.citation_validator(immutable_messages)
-            if not isinstance(result, CitationValidationResult):
+            if not isinstance(result, CitationValidationEvent):
                 raise TypeError(
-                    "citation_validator 必须返回 CitationValidationResult"
+                    "citation_validator 必须返回 CitationValidationEvent"
                 )
             allowed_statuses = {
                 "valid",
                 "missing",
                 "unknown",
                 "not_applicable",
+                "error",
             }
             counts = (
                 result.citation_count,
@@ -460,13 +550,7 @@ class WorkspaceAgent:
                 or any(type(value) is not int or value < 0 for value in counts)
             ):
                 raise ValueError("citation_validator 返回了无效结果")
-            return CitationValidationEvent(
-                status=result.status,
-                citation_count=result.citation_count,
-                valid_citation_count=result.valid_citation_count,
-                unknown_citation_count=result.unknown_citation_count,
-                retrieved_chunk_count=result.retrieved_chunk_count,
-            )
+            return result
         except Exception:
             return CitationValidationEvent(
                 status="error",
@@ -475,6 +559,36 @@ class WorkspaceAgent:
                 unknown_citation_count=0,
                 retrieved_chunk_count=0,
             )
+
+    def _citation_policy_event(
+        self,
+        validation_event: CitationValidationEvent | None,
+        *,
+        guarded_tool_used: bool,
+    ) -> CitationPolicyEvent | None:
+        if validation_event is None:
+            return None
+        if self.citation_policy == "observe":
+            action = "observed"
+        elif guarded_tool_used and validation_event.status != "valid":
+            action = "blocked"
+        else:
+            action = "allowed"
+        return CitationPolicyEvent(
+            policy=self.citation_policy,
+            action=action,
+            validation_status=validation_event.status,
+        )
+
+    def _guarded_tool_was_used(
+        self,
+        current_turn_messages: list,
+    ) -> bool:
+        return any(
+            isinstance(message, ToolMessage)
+            and message.name in self.citation_guard_tool_names
+            for message in current_turn_messages
+        )
 
     def _trim_history(self, messages: list) -> list:
         return trim_messages(

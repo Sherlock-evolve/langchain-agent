@@ -10,11 +10,11 @@ from numbers import Real
 from langchain_core.messages import AIMessage, ToolMessage
 
 from citations import (
-    CitationValidationResult,
     format_citation,
     has_unsafe_control_characters,
     validate_answer_citations,
 )
+from contracts import CitationValidationEvent
 from knowledge_retriever import RetrievedChunk
 
 
@@ -172,7 +172,7 @@ def _final_answer(messages: Sequence) -> str:
 
 def validate_knowledge_citations(
     current_turn_messages: Sequence,
-) -> CitationValidationResult:
+) -> CitationValidationEvent:
     """Validate only the supplied turn, without retaining mutable state."""
 
     search_messages = [
@@ -184,7 +184,7 @@ def validate_knowledge_citations(
         )
     ]
     if not search_messages:
-        return CitationValidationResult(
+        return CitationValidationEvent(
             status="not_applicable",
             citation_count=0,
             valid_citation_count=0,
@@ -204,7 +204,14 @@ def validate_knowledge_citations(
             )
         retrieved_chunks.extend(message_chunks)
 
-    return validate_answer_citations(
+    result = validate_answer_citations(
         _final_answer(current_turn_messages),
         retrieved_chunks,
+    )
+    return CitationValidationEvent(
+        status=result.status,
+        citation_count=result.citation_count,
+        valid_citation_count=result.valid_citation_count,
+        unknown_citation_count=result.unknown_citation_count,
+        retrieved_chunk_count=result.retrieved_chunk_count,
     )

@@ -216,11 +216,20 @@ def test_enabled_runtime_builds_once_registers_tool_and_uses_fallbacks(
             knowledge_builder=knowledge_builder,
         )
 
-    def agent_factory(extra_tools=None, citation_validator=None):
+    def agent_factory(
+        extra_tools=None,
+        citation_validator=None,
+        citation_policy="observe",
+        citation_guard_tool_names=None,
+    ):
         agent = WorkspaceAgent(
             model=ScriptedModel([]),
             tools=list(extra_tools or ()),
             citation_validator=citation_validator,
+            citation_policy=citation_policy,
+            citation_guard_tool_names=set(
+                citation_guard_tool_names or ()
+            ),
         )
         created_agents.append(agent)
         return agent
@@ -278,7 +287,12 @@ def test_session_switches_share_tool_but_not_agent_history(
         runtime_calls.append(kwargs)
         return runtime
 
-    def agent_factory(extra_tools=None, citation_validator=None):
+    def agent_factory(
+        extra_tools=None,
+        citation_validator=None,
+        citation_policy="observe",
+        citation_guard_tool_names=None,
+    ):
         responses = (
             [[AIMessageChunk(content="第一个会话回答")]]
             if not created_agents
@@ -288,6 +302,10 @@ def test_session_switches_share_tool_but_not_agent_history(
             model=ScriptedModel(responses),
             tools=list(extra_tools or ()),
             citation_validator=citation_validator,
+            citation_policy=citation_policy,
+            citation_guard_tool_names=set(
+                citation_guard_tool_names or ()
+            ),
         )
         created_agents.append(agent)
         return agent
@@ -464,12 +482,21 @@ def test_cli_rag_round_trip_persists_citation_and_audits_no_body(
     )
     created_agents = []
 
-    def agent_factory(extra_tools=None, citation_validator=None):
+    def agent_factory(
+        extra_tools=None,
+        citation_validator=None,
+        citation_policy="observe",
+        citation_guard_tool_names=None,
+    ):
         agent = WorkspaceAgent(
             model=model,
             tools=list(extra_tools or ()),
             monotonic_clock=lambda: 0.0,
             citation_validator=citation_validator,
+            citation_policy=citation_policy,
+            citation_guard_tool_names=set(
+                citation_guard_tool_names or ()
+            ),
         )
         created_agents.append(agent)
         return agent
